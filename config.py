@@ -57,8 +57,6 @@ class Config:
     allowed_users: set[int]
     excluded_chat_ids: set[int]
     target_bot_username: str
-    max_all: int
-    max_period: int
     log_level: str
     database_path: Path
     logs_dir: Path
@@ -87,8 +85,6 @@ def load_config() -> Config:
     allowed_users = _csv_ints('ALLOWED_USERS')
     excluded_chat_ids = _csv_ints('EXCLUDED_CHAT_IDS')
     target_bot_username = os.getenv('TARGET_BOT_USERNAME', 'Content_Vertical_BOT').strip().lstrip('@')
-    max_all = _int('MAX_MESSAGES_PER_CHAT_ALL', 0)
-    max_period = _int('MAX_MESSAGES_PER_CHAT_PERIOD', 0)
     log_level = os.getenv('LOG_LEVEL', 'INFO').strip().upper()
 
     database_path = Path(os.getenv('DATABASE_PATH', str(BASE_DIR / 'data' / 'bot.sqlite3'))).resolve()
@@ -125,8 +121,6 @@ def load_config() -> Config:
         allowed_users=allowed_users,
         excluded_chat_ids=excluded_chat_ids,
         target_bot_username=target_bot_username,
-        max_all=max_all,
-        max_period=max_period,
         log_level=log_level,
         database_path=database_path,
         logs_dir=logs_dir,
