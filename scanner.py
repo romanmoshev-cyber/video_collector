@@ -70,8 +70,25 @@ def _matches_rules(w: int, h: int, duration: int, size: int) -> bool:
     return size >= min_size
 
 
-def _limit_or_none(n: int) -> int | None:
-    return None if n <= 0 else n
+SKIPPED_DIALOG_NAMES = {'избранное', 'saved messages', 'подборки 18+'}
+SKIPPED_DIALOG_PREFIXES = ('vertical',)
+
+
+def _dialog_name(dialog: Dialog) -> str:
+    return (dialog.name or '').strip()
+
+
+def _should_scan_dialog(dialog: Dialog) -> bool:
+    name = _dialog_name(dialog)
+    normalized_name = name.casefold()
+
+    if getattr(dialog.entity, 'self', False):
+        return False
+    if normalized_name in SKIPPED_DIALOG_NAMES:
+        return False
+    if normalized_name.startswith(SKIPPED_DIALOG_PREFIXES):
+        return False
+    return bool(dialog.is_group or dialog.is_channel)
 
 
 class Scanner:
@@ -82,8 +99,6 @@ class Scanner:
         heartbeat: Heartbeat,
         excluded_chat_ids: set[int],
         target_bot_username: str,
-        max_all: int,
-        max_period: int,
         forward_delay_sec: float,
         forward_jitter_sec: float,
         dialog_delay_sec: float,
@@ -95,8 +110,6 @@ class Scanner:
         self.heartbeat = heartbeat
         self.excluded = excluded_chat_ids
         self.target_bot_username = target_bot_username
-        self.max_all = max_all
-        self.max_period = max_period
         self.forward_delay_sec = max(0.3, forward_delay_sec)
         self.forward_jitter_sec = max(0.0, forward_jitter_sec)
         self.dialog_delay_sec = max(0.0, dialog_delay_sec)
@@ -108,6 +121,8 @@ class Scanner:
         dialogs: list[dict[str, Any]] = []
         async for d in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
             if d.id in self.excluded:
+                continue
+            if not _should_scan_dialog(d):
                 continue
             link = None
             username = getattr(d.entity, 'username', None)
@@ -161,6 +176,8 @@ class Scanner:
         async for d in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
             if d.id in self.excluded:
                 continue
+            if not _should_scan_dialog(d):
+                continue
             if opts.chat_ids is not None and d.id not in opts.chat_ids:
                 continue
             dialogs.append(d)
@@ -187,8 +204,7 @@ class Scanner:
                 break
 
             dialog_name = dialog.name or str(chat_id)
-            per_limit = self.max_all if opts.mode == 'all' else self.max_period
-            limit = _limit_or_none(per_limit)
+            limit = None
             min_id = 0
             reverse = opts.order == 'old_to_new'
             max_id_seen = 0
