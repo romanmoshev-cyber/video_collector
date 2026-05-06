@@ -438,7 +438,6 @@ class Scanner:
             'top_chats': sorted(per_chat_stats, key=lambda x: (x['matched'], x['forwarded'], x['checked']), reverse=True)[:10],
             'errors': total_errors,
             'empty_chats_count': len(empty_chats),
-            'empty_chats': empty_chats,
             'empty_chats_updated': bool(can_update_empty_list and not cancelled and total_errors == 0),
             'cancelled': cancelled,
             'elapsed_sec': elapsed,
@@ -447,8 +446,9 @@ class Scanner:
         if can_update_empty_list and not cancelled and total_errors == 0:
             await self.save_empty_chats(empty_chats)
 
-        log.info('Scan finish: %s', result)
-        self.heartbeat.beat(status='scan_done', result_summary={k: result[k] for k in ('dialogs', 'checked', 'matched', 'forwarded', 'errors', 'empty_chats_count', 'cancelled', 'elapsed_sec')})
+        result_summary = {k: result[k] for k in ('dialogs', 'checked', 'matched', 'forwarded', 'errors', 'empty_chats_count', 'cancelled', 'elapsed_sec')}
+        log.info('Scan finish: %s', result_summary)
+        self.heartbeat.beat(status='scan_done', result_summary=result_summary)
         if progress_cb:
             await progress_cb({'type': 'done', **result})
         return result
