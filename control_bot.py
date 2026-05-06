@@ -36,63 +36,120 @@ def _is_allowed(user_id: int, allowed: set[int]) -> bool:
     return (not allowed) or (user_id in allowed)
 
 
+def _mode_label(mode: str) -> str:
+    labels = {
+        'all': 'всё',
+        'month': 'месяц',
+        'week': 'неделя',
+        'new': 'только новые',
+    }
+    return labels.get(mode, mode)
+
+
+def _order_label(order: str) -> str:
+    labels = {
+        'new_to_old': 'новые → старые',
+        'old_to_new': 'старые → новые',
+    }
+    return labels.get(order, order)
+
+
+def _short_title(name: str, limit: int = 18) -> str:
+    name = ' '.join((name or 'Без названия').split())
+    return name if len(name) <= limit else f'{name[:limit - 1]}…'
+
+
+def _main_text(st: UserState, is_scanning: bool) -> str:
+    status = 'идёт сканирование' if is_scanning else 'готов к запуску'
+    return (
+        '🎬 <b>Video Collector</b>\n'
+        f'Статус: <b>{status}</b>\n'
+        f'Период: <b>{escape(_mode_label(st.mode))}</b> · '
+        f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
+        f'Выбрано чатов: <b>{len(st.selected_chats)}</b>\n\n'
+        'Выбери действие кнопками ниже.'
+    )
+
+
 def _main_kb(is_scanning: bool):
     kb = InlineKeyboardBuilder()
-    kb.button(text='🔎 Поиск во всех', callback_data='scan:allchats')
-    kb.button(text='📌 Выбрать чаты/каналы', callback_data='pick:open')
+    kb.button(text='🔎 Все чаты', callback_data='scan:allchats')
+    kb.button(text='📌 Выбрать', callback_data='pick:open')
     kb.button(text='⏱ Период', callback_data='mode:open')
     kb.button(text='🔁 Порядок', callback_data='order:open')
-    kb.button(text='📊 Последний отчёт', callback_data='report:last')
-    kb.button(text='🧹 Пустые каналы/группы', callback_data='empty:list')
+    kb.button(text='📊 Отчёт', callback_data='report:last')
+    kb.button(text='🧹 Пустые', callback_data='empty:list')
     kb.button(text='📄 Статус', callback_data='status')
     if is_scanning:
         kb.button(text='⛔ Стоп', callback_data='scan:stop')
-    kb.adjust(1)
+        kb.adjust(2, 2, 2, 2)
+    else:
+        kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 
 def _mode_kb(current: str):
-    items = [('all', 'Всё'), ('month', 'Последний месяц'), ('week', 'Последняя неделя'), ('new', 'Только новые')]
+    items = [('all', 'Всё'), ('month', 'Месяц'), ('week', 'Неделя'), ('new', 'Новые')]
     kb = InlineKeyboardBuilder()
     for code, label in items:
         mark = '✅ ' if code == current else ''
         kb.button(text=f'{mark}{label}', callback_data=f'mode:set:{code}')
     kb.button(text='⬅️ Назад', callback_data='back:main')
-    kb.adjust(1)
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
 def _order_kb(current: str):
-    items = [('new_to_old', 'Новые → старые'), ('old_to_new', 'Старые → новые')]
+    items = [('new_to_old', '⬇️ Новые'), ('old_to_new', '⬆️ Старые')]
     kb = InlineKeyboardBuilder()
     for code, label in items:
         mark = '✅ ' if code == current else ''
         kb.button(text=f'{mark}{label}', callback_data=f'order:set:{code}')
     kb.button(text='⬅️ Назад', callback_data='back:main')
-    kb.adjust(1)
+    kb.adjust(2, 1)
     return kb.as_markup()
 
 
-def _pick_kb(dialogs: list[dict[str, Any]], selected: set[int], page: int, per_page: int = 12):
+def _pick_text(dialogs: list[dict[str, Any]], selected: set[int], page: int, per_page: int = 20) -> str:
+    total = len(dialogs)
+    pages = max(1, (total + per_page - 1) // per_page)
+    return (
+        '📌 <b>Выбор чатов/каналов</b>\n'
+        f'Страница: <b>{page + 1} / {pages}</b> · всего: <b>{total}</b>\n'
+        f'Выбрано: <b>{len(selected)}</b>\n\n'
+        'Список сделан в 2 колонки, чтобы на экране помещалось больше чатов.'
+    )
+
+
+def _pick_kb(dialogs: list[dict[str, Any]], selected: set[int], page: int, per_page: int = 20):
     kb = InlineKeyboardBuilder()
     start = page * per_page
     chunk = dialogs[start:start + per_page]
 
     for item in chunk:
         did = item['id']
-        name = item['name']
-        mark = '✅' if did in selected else '➕'
-        kb.button(text=f'{mark} {name[:32]}', callback_data=f'pick:toggle:{did}')
+        mark = '✅' if did in selected else '＋'
+        kb.button(text=f'{mark} {_short_title(item.get("name") or "")}', callback_data=f'pick:toggle:{did}')
 
+    sizes = [2] * (len(chunk) // 2)
+    if len(chunk) % 2:
+        sizes.append(1)
+
+    nav_count = 0
     if page > 0:
-        kb.button(text='⬅️', callback_data='pick:page:prev')
+        kb.button(text='⬅️ Назад', callback_data='pick:page:prev')
+        nav_count += 1
     if start + per_page < len(dialogs):
-        kb.button(text='➡️', callback_data='pick:page:next')
+        kb.button(text='Вперёд ➡️', callback_data='pick:page:next')
+        nav_count += 1
+    if nav_count:
+        sizes.append(nav_count)
 
-    kb.button(text='🚀 Старт (по выбранным)', callback_data='scan:selected')
-    kb.button(text='🧹 Очистить выбор', callback_data='pick:clear')
-    kb.button(text='⬅️ Назад', callback_data='back:main')
-    kb.adjust(1)
+    kb.button(text='🚀 Старт', callback_data='scan:selected')
+    kb.button(text='🧹 Сброс', callback_data='pick:clear')
+    kb.button(text='⬅️ В меню', callback_data='back:main')
+    sizes.extend([2, 1])
+    kb.adjust(*sizes)
     return kb.as_markup()
 
 
@@ -125,8 +182,16 @@ def _empty_item_kb(item: dict[str, Any], page: int, total: int):
     if page + 1 < total:
         kb.button(text='➡️', callback_data='empty:nav:next')
 
-    kb.button(text='⬅️ Назад', callback_data='back:main')
-    kb.adjust(1)
+    kb.button(text='⬅️ В меню', callback_data='back:main')
+    sizes = []
+    if item.get('link'):
+        sizes.append(1)
+    sizes.extend([2, 1])
+    nav_count = int(page > 0) + int(page + 1 < total)
+    if nav_count:
+        sizes.append(nav_count)
+    sizes.append(1)
+    kb.adjust(*sizes)
     return kb.as_markup()
 
 
@@ -134,7 +199,7 @@ def _confirm_delete_kb(chat_id: int):
     kb = InlineKeyboardBuilder()
     kb.button(text='✅ Да, удалить/выйти', callback_data=f'empty:delete:do:{chat_id}')
     kb.button(text='↩️ Отмена', callback_data='empty:list')
-    kb.adjust(1)
+    kb.adjust(2)
     return kb.as_markup()
 
 
@@ -142,7 +207,7 @@ def _confirm_delete_all_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text='✅ Да, удалить/выйти из всех', callback_data='empty:delete_all:do')
     kb.button(text='↩️ Отмена', callback_data='empty:list')
-    kb.adjust(1)
+    kb.adjust(2)
     return kb.as_markup()
 
 
@@ -209,15 +274,17 @@ async def run_control_bot(
     async def start(m: Message):
         if not _is_allowed(m.from_user.id, allowed_users):
             return
+        st = await get_state(m.from_user.id)
         heartbeat.beat(status='menu_open', user_id=m.from_user.id)
-        await m.answer('Меню:', reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+        await m.answer(_main_text(st, scan_lock.locked()), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
 
     @dp.callback_query(F.data == 'back:main')
     async def back_main(c: CallbackQuery):
         if not _is_allowed(c.from_user.id, allowed_users):
             return
+        st = await get_state(c.from_user.id)
         heartbeat.beat(status='back_main', user_id=c.from_user.id)
-        await safe_edit_text(c.message, 'Меню:', reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+        await safe_edit_text(c.message, _main_text(st, scan_lock.locked()), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
         await c.answer()
 
     @dp.callback_query(F.data == 'mode:open')
@@ -225,7 +292,7 @@ async def run_control_bot(
         if not _is_allowed(c.from_user.id, allowed_users):
             return
         st = await get_state(c.from_user.id)
-        await safe_edit_text(c.message, 'Выбери период:', reply_markup=_mode_kb(st.mode))
+        await safe_edit_text(c.message, '⏱ <b>Период сканирования</b>\nВыбери, какие сообщения проверять:', reply_markup=_mode_kb(st.mode))
         await c.answer()
 
     @dp.callback_query(F.data.startswith('mode:set:'))
@@ -234,7 +301,7 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         st.mode = c.data.split(':')[-1]
-        await safe_edit_text(c.message, f'Период установлен: <b>{escape(st.mode)}</b>', reply_markup=_mode_kb(st.mode))
+        await safe_edit_text(c.message, f'⏱ Период: <b>{escape(_mode_label(st.mode))}</b>', reply_markup=_mode_kb(st.mode))
         await c.answer('Ок')
 
     @dp.callback_query(F.data == 'order:open')
@@ -242,7 +309,7 @@ async def run_control_bot(
         if not _is_allowed(c.from_user.id, allowed_users):
             return
         st = await get_state(c.from_user.id)
-        await safe_edit_text(c.message, 'Выбери порядок сканирования:', reply_markup=_order_kb(st.order))
+        await safe_edit_text(c.message, '🔁 <b>Порядок сканирования</b>\nС какой стороны читать историю:', reply_markup=_order_kb(st.order))
         await c.answer()
 
     @dp.callback_query(F.data.startswith('order:set:'))
@@ -251,7 +318,7 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         st.order = c.data.split(':')[-1]
-        await safe_edit_text(c.message, f'Порядок установлен: <b>{escape(st.order)}</b>', reply_markup=_order_kb(st.order))
+        await safe_edit_text(c.message, f'🔁 Порядок: <b>{escape(_order_label(st.order))}</b>', reply_markup=_order_kb(st.order))
         await c.answer('Ок')
 
     @dp.callback_query(F.data == 'pick:open')
@@ -266,7 +333,7 @@ async def run_control_bot(
         st.page = 0
         await safe_edit_text(
             c.message,
-            f'Выбери чаты/каналы (всего: <b>{len(st.dialogs_cache)}</b>):',
+            _pick_text(st.dialogs_cache, st.selected_chats, st.page),
             reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page),
         )
         await c.answer()
@@ -281,10 +348,11 @@ async def run_control_bot(
             st.selected_chats.remove(did)
         else:
             st.selected_chats.add(did)
-        try:
-            await c.message.edit_reply_markup(reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page))
-        except TelegramBadRequest:
-            pass
+        await safe_edit_text(
+            c.message,
+            _pick_text(st.dialogs_cache, st.selected_chats, st.page),
+            reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page),
+        )
         await c.answer()
 
     @dp.callback_query(F.data == 'pick:clear')
@@ -293,10 +361,11 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         st.selected_chats.clear()
-        try:
-            await c.message.edit_reply_markup(reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page))
-        except TelegramBadRequest:
-            pass
+        await safe_edit_text(
+            c.message,
+            _pick_text(st.dialogs_cache, st.selected_chats, st.page),
+            reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page),
+        )
         await c.answer('Очищено')
 
     @dp.callback_query(F.data.startswith('pick:page:'))
@@ -309,10 +378,11 @@ async def run_control_bot(
             st.page += 1
         elif direction == 'prev' and st.page > 0:
             st.page -= 1
-        try:
-            await c.message.edit_reply_markup(reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page))
-        except TelegramBadRequest:
-            pass
+        await safe_edit_text(
+            c.message,
+            _pick_text(st.dialogs_cache, st.selected_chats, st.page),
+            reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page),
+        )
         await c.answer()
 
     @dp.callback_query(F.data == 'status')
@@ -322,15 +392,16 @@ async def run_control_bot(
         st = await get_state(c.from_user.id)
         await c.answer()
         msg = (
-            f'Период: <b>{escape(st.mode)}</b>\n'
-            f'Порядок: <b>{escape(st.order)}</b>\n'
+            '📄 <b>Статус</b>\n'
+            f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
+            f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
             f'Выбрано чатов: <b>{len(st.selected_chats)}</b>\n'
             f'Скан сейчас: <b>{"да" if scan_lock.locked() else "нет"}</b>\n'
             f'Heartbeat age: <b>{heartbeat.age():.1f} сек</b>'
         )
         if st.last_run_at:
             msg += f'\nПоследний запуск: <b>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.last_run_at))}</b>'
-        await c.message.answer(msg)
+        await safe_edit_text(c.message, msg, reply_markup=_main_kb(scan_lock.locked()))
 
     @dp.callback_query(F.data == 'report:last')
     async def report_last(c: CallbackQuery):
@@ -338,7 +409,7 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         await c.answer()
-        await c.message.answer(_format_report(st.last_stats))
+        await safe_edit_text(c.message, _format_report(st.last_stats), reply_markup=_main_kb(scan_lock.locked()))
 
     @dp.callback_query(F.data == 'empty:list')
     async def empty_list(c: CallbackQuery):
@@ -585,6 +656,6 @@ async def run_control_bot(
         st.last_empty_page = 0
         tail = '\n⛔ <b>Остановлено</b>' if stats.get('cancelled') else '\n✅ <b>Завершено</b>'
         await safe_edit_text(progress_msg, _format_report(stats) + tail)
-        await c.message.answer('Меню:', reply_markup=_main_kb(is_scanning=False))
+        await c.message.answer(_main_text(st, False), reply_markup=_main_kb(is_scanning=False))
 
     await dp.start_polling(bot, polling_timeout=10, handle_as_tasks=True, close_bot_session=True)
