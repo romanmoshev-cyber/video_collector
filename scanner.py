@@ -91,6 +91,9 @@ def _should_scan_dialog(dialog: Dialog) -> bool:
     return bool(dialog.is_group or dialog.is_channel)
 
 
+EMPTY_CHATS_KEY = 'empty_chats:last_full_scan'
+
+
 class Scanner:
     def __init__(
         self,
@@ -141,6 +144,16 @@ class Scanner:
             )
         return dialogs
 
+    async def get_saved_empty_chats(self) -> list[dict[str, Any]]:
+        return await self.db.kv_get_json(EMPTY_CHATS_KEY, [])
+
+    async def save_empty_chats(self, empty_chats: list[dict[str, Any]]) -> None:
+        await self.db.kv_set_json(EMPTY_CHATS_KEY, empty_chats)
+
+    async def forget_empty_chat(self, chat_id: int) -> None:
+        empty_chats = await self.get_saved_empty_chats()
+        await self.save_empty_chats([x for x in empty_chats if int(x.get('id', 0)) != chat_id])
+
     async def delete_dialog_by_id(self, chat_id: int) -> tuple[bool, str]:
         async with self._delete_lock:
             try:
@@ -190,6 +203,7 @@ class Scanner:
         total_skipped = 0
         cancelled = False
         empty_chats: list[dict[str, Any]] = []
+        can_update_empty_list = opts.mode == 'all' and opts.chat_ids is None
 
         if progress_cb:
             await progress_cb({'type': 'init', 'dialogs_total': len(dialogs), 'mode': opts.mode, 'order': opts.order})
@@ -212,6 +226,7 @@ class Scanner:
             matched_in_chat = 0
             forwarded_in_chat = 0
             hard_stopped_by_date = False
+            chat_had_error = False
 
             if opts.mode == 'new':
                 min_id = await self.db.get_last_scanned(chat_id)
@@ -321,6 +336,7 @@ class Scanner:
                     await asyncio.sleep(delay)
 
             except FloodWaitError as e:
+                chat_had_error = True
                 total_errors += 1
                 wait_s = int(getattr(e, 'seconds', 1))
                 log.warning('FloodWait %ss on chat_id=%s', wait_s, chat_id)
@@ -332,11 +348,13 @@ class Scanner:
                     break
                 await asyncio.sleep(wait_s + 1)
             except RPCError:
+                chat_had_error = True
                 total_errors += 1
                 log.exception('RPC error on chat_id=%s', chat_id)
                 if progress_cb:
                     await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'rpc_error'})
             except Exception:
+                chat_had_error = True
                 total_errors += 1
                 log.exception('Unexpected error on chat_id=%s', chat_id)
                 if progress_cb:
@@ -345,7 +363,7 @@ class Scanner:
                 if opts.mode == 'new' and max_id_seen > min_id:
                     await self.db.set_last_scanned(chat_id, max_id_seen, int(time.time()))
 
-            if checked_in_chat > 0 and matched_in_chat == 0:
+            if can_update_empty_list and not cancelled and not chat_had_error and matched_in_chat == 0:
                 username = getattr(dialog.entity, 'username', None)
                 link = f'https://t.me/{username}' if username else None
                 empty_chats.append(
@@ -389,9 +407,13 @@ class Scanner:
             'errors': total_errors,
             'empty_chats_count': len(empty_chats),
             'empty_chats': empty_chats,
+            'empty_chats_updated': bool(can_update_empty_list and not cancelled and total_errors == 0),
             'cancelled': cancelled,
             'elapsed_sec': elapsed,
         }
+
+        if can_update_empty_list and not cancelled and total_errors == 0:
+            await self.save_empty_chats(empty_chats)
 
         log.info('Scan finish: %s', result)
         self.heartbeat.beat(status='scan_done', result_summary={k: result[k] for k in ('dialogs', 'checked', 'matched', 'forwarded', 'errors', 'empty_chats_count', 'cancelled', 'elapsed_sec')})

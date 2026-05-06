@@ -117,6 +117,8 @@ def _empty_item_kb(item: dict[str, Any], page: int, total: int):
     if item.get('link'):
         kb.button(text='🔗 Открыть', url=item['link'])
     kb.button(text='🗑 Удалить/выйти', callback_data=f'empty:delete:confirm:{item["id"]}')
+    kb.button(text='❌ Убрать из списка', callback_data=f'empty:forget:{item["id"]}')
+    kb.button(text='🧨 Удалить/выйти из всех', callback_data='empty:delete_all:confirm')
 
     if page > 0:
         kb.button(text='⬅️', callback_data='empty:nav:prev')
@@ -136,6 +138,14 @@ def _confirm_delete_kb(chat_id: int):
     return kb.as_markup()
 
 
+def _confirm_delete_all_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text='✅ Да, удалить/выйти из всех', callback_data='empty:delete_all:do')
+    kb.button(text='↩️ Отмена', callback_data='empty:list')
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def _format_report(stats: Optional[dict[str, Any]]) -> str:
     if not stats:
         return 'Отчёта пока нет.'
@@ -148,6 +158,7 @@ def _format_report(stats: Optional[dict[str, Any]]) -> str:
         f'Пропущено как дубль: <b>{stats.get("skipped_already_forwarded", 0)}</b>',
         f'Ошибок: <b>{stats.get("errors", 0)}</b>',
         f'Пустых каналов/групп: <b>{stats.get("empty_chats_count", 0)}</b>',
+        f'Список пустых обновлён: <b>{"да" if stats.get("empty_chats_updated") else "нет"}</b>',
         f'Время: <b>{stats.get("elapsed_sec", 0)} сек</b>',
         'Статус: ⛔ остановлено' if stats.get('cancelled') else 'Статус: ✅ завершено',
     ]
@@ -182,7 +193,11 @@ async def run_control_bot(
             log.exception('safe_edit_text failed')
 
     async def render_empty_list(message: Message, st: UserState):
-        empty = (st.last_stats or {}).get('empty_chats') or []
+        empty = await scanner.get_saved_empty_chats()
+        if st.last_stats is None:
+            st.last_stats = {}
+        st.last_stats['empty_chats'] = empty
+        st.last_stats['empty_chats_count'] = len(empty)
         if not empty:
             await safe_edit_text(message, 'Список пустых каналов/групп пока пуст.', reply_markup=_main_kb(scan_lock.locked()))
             return
@@ -350,6 +365,23 @@ async def run_control_bot(
         await render_empty_list(c.message, st)
         await c.answer()
 
+    @dp.callback_query(F.data.startswith('empty:forget:'))
+    async def empty_forget(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        chat_id = int(c.data.split(':')[-1])
+        await scanner.forget_empty_chat(chat_id)
+        empty = await scanner.get_saved_empty_chats()
+        if st.last_stats is None:
+            st.last_stats = {}
+        st.last_stats['empty_chats'] = empty
+        st.last_stats['empty_chats_count'] = len(empty)
+        if st.last_empty_page >= len(empty) and st.last_empty_page > 0:
+            st.last_empty_page -= 1
+        await render_empty_list(c.message, st)
+        await c.answer('Убрано из списка')
+
     @dp.callback_query(F.data.startswith('empty:delete:confirm:'))
     async def empty_delete_confirm(c: CallbackQuery):
         if not _is_allowed(c.from_user.id, allowed_users):
@@ -378,9 +410,10 @@ async def run_control_bot(
         chat_id = int(c.data.split(':')[-1])
         ok, info = await scanner.delete_dialog_by_id(chat_id)
         if ok:
-            empty = (st.last_stats or {}).get('empty_chats') or []
-            st.last_stats['empty_chats'] = [x for x in empty if int(x['id']) != chat_id]
-            st.last_stats['empty_chats_count'] = len(st.last_stats['empty_chats'])
+            await scanner.forget_empty_chat(chat_id)
+            empty = await scanner.get_saved_empty_chats()
+            st.last_stats['empty_chats'] = empty
+            st.last_stats['empty_chats_count'] = len(empty)
             if st.last_empty_page >= len(st.last_stats['empty_chats']) and st.last_empty_page > 0:
                 st.last_empty_page -= 1
             if st.last_stats['empty_chats']:
@@ -390,6 +423,64 @@ async def run_control_bot(
         else:
             await c.message.answer(f'Не удалось удалить: {escape(info)}')
         await c.answer('Готово' if ok else 'Ошибка')
+
+    @dp.callback_query(F.data == 'empty:delete_all:confirm')
+    async def empty_delete_all_confirm(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        empty = await scanner.get_saved_empty_chats()
+        if not empty:
+            await c.answer('Список пуст.', show_alert=False)
+            return
+        text = (
+            f'⚠️ <b>Подтверди массовое удаление/выход</b>\n\n'
+            f'Будет обработано чатов: <b>{len(empty)}</b>.\n'
+            f'Это удалит диалоги из аккаунта и выйдет из каналов/групп, если Telegram это разрешает.'
+        )
+        await safe_edit_text(c.message, text, reply_markup=_confirm_delete_all_kb())
+        await c.answer()
+
+    @dp.callback_query(F.data == 'empty:delete_all:do')
+    async def empty_delete_all_do(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        empty = await scanner.get_saved_empty_chats()
+        if not empty:
+            await c.answer('Список пуст.', show_alert=False)
+            return
+        await c.answer('Удаляю…', show_alert=False)
+        progress_msg = c.message
+        deleted = 0
+        failed: list[str] = []
+        for idx, item in enumerate(list(empty), start=1):
+            chat_id = int(item['id'])
+            await safe_edit_text(
+                progress_msg,
+                f'🧨 Массовое удаление/выход\nЧат: <b>{idx} / {len(empty)}</b>\nУдалено: <b>{deleted}</b>\nОшибок: <b>{len(failed)}</b>',
+            )
+            ok, info = await scanner.delete_dialog_by_id(chat_id)
+            if ok:
+                deleted += 1
+                await scanner.forget_empty_chat(chat_id)
+            else:
+                failed.append(f'{item.get("name") or chat_id}: {info}')
+        remaining = await scanner.get_saved_empty_chats()
+        if st.last_stats is None:
+            st.last_stats = {}
+        st.last_stats['empty_chats'] = remaining
+        st.last_stats['empty_chats_count'] = len(remaining)
+        st.last_empty_page = 0
+        fail_text = ''
+        if failed:
+            fail_text = '\n\nНе удалось:\n' + '\n'.join(f'• {escape(x)}' for x in failed[:10])
+            if len(failed) > 10:
+                fail_text += f'\n…и ещё {len(failed) - 10}'
+        await safe_edit_text(
+            progress_msg,
+            f'✅ Массовое удаление/выход завершено.\nУдалено: <b>{deleted}</b>\nОсталось в списке: <b>{len(remaining)}</b>{fail_text}',
+            reply_markup=_main_kb(scan_lock.locked()),
+        )
 
     @dp.callback_query(F.data == 'scan:stop')
     async def scan_stop(c: CallbackQuery):
