@@ -30,6 +30,8 @@ class ScanOptions:
 
 def _since_dt(mode: str) -> Optional[datetime]:
     now = datetime.now(timezone.utc)
+    if mode == 'day':
+        return now - timedelta(days=1)
     if mode == 'week':
         return now - timedelta(days=7)
     if mode == 'month':
@@ -59,15 +61,21 @@ def _extract_video_meta(msg: Message) -> tuple[int, int, int, int] | None:
     return int(w), int(h), int(duration), size
 
 
-def _matches_rules(w: int, h: int, duration: int, size: int) -> bool:
+def _reject_reason(w: int, h: int, duration: int, size: int) -> str | None:
     if h <= w:
-        return False
+        return 'not_vertical'
     if duration < 180:
-        return False
+        return 'too_short'
     if w < 900:
-        return False
+        return 'too_narrow'
     min_size = (duration / 60.0) * (10 * MB)
-    return size >= min_size
+    if size < min_size:
+        return 'too_small'
+    return None
+
+
+def _matches_rules(w: int, h: int, duration: int, size: int) -> bool:
+    return _reject_reason(w, h, duration, size) is None
 
 
 SKIPPED_DIALOG_NAMES = {'избранное', 'saved messages', 'подборки 18+'}
@@ -201,6 +209,9 @@ class Scanner:
         total_forwarded = 0
         total_errors = 0
         total_skipped = 0
+        total_video_found = 0
+        reject_reasons = {'not_vertical': 0, 'too_short': 0, 'too_narrow': 0, 'too_small': 0}
+        per_chat_stats: list[dict[str, Any]] = []
         cancelled = False
         empty_chats: list[dict[str, Any]] = []
         can_update_empty_list = opts.mode == 'all' and opts.chat_ids is None
@@ -227,6 +238,7 @@ class Scanner:
             forwarded_in_chat = 0
             hard_stopped_by_date = False
             chat_had_error = False
+            chat_finished_cleanly = False
 
             if opts.mode == 'new':
                 min_id = await self.db.get_last_scanned(chat_id)
@@ -268,7 +280,8 @@ class Scanner:
                         max_id_seen = msg.id
 
                     if since and msg.date:
-                        msg_dt = msg.date.replace(tzinfo=timezone.utc)
+                        msg_dt = msg.date if msg.date.tzinfo else msg.date.replace(tzinfo=timezone.utc)
+                        msg_dt = msg_dt.astimezone(timezone.utc)
                         if msg_dt < since and not reverse:
                             hard_stopped_by_date = True
                             break
@@ -281,8 +294,11 @@ class Scanner:
                             await progress_cb({'type': 'tick', 'chat_id': chat_id, 'checked': total_checked, 'matched': total_matched, 'forwarded': total_forwarded})
                         continue
 
+                    total_video_found += 1
                     w, h, duration, size = meta
-                    if not _matches_rules(w, h, duration, size):
+                    reject_reason = _reject_reason(w, h, duration, size)
+                    if reject_reason:
+                        reject_reasons[reject_reason] += 1
                         continue
 
                     matched_in_chat += 1
@@ -335,6 +351,8 @@ class Scanner:
                     delay = self.forward_delay_sec + random.uniform(0, self.forward_jitter_sec)
                     await asyncio.sleep(delay)
 
+                chat_finished_cleanly = not cancelled
+
             except FloodWaitError as e:
                 chat_had_error = True
                 total_errors += 1
@@ -360,8 +378,19 @@ class Scanner:
                 if progress_cb:
                     await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'exception'})
             finally:
-                if opts.mode == 'new' and max_id_seen > min_id:
+                if opts.mode == 'new' and chat_finished_cleanly and max_id_seen > min_id:
                     await self.db.set_last_scanned(chat_id, max_id_seen, int(time.time()))
+
+            if not chat_had_error:
+                per_chat_stats.append(
+                    {
+                        'id': chat_id,
+                        'name': dialog_name,
+                        'checked': checked_in_chat,
+                        'matched': matched_in_chat,
+                        'forwarded': forwarded_in_chat,
+                    }
+                )
 
             if can_update_empty_list and not cancelled and not chat_had_error and matched_in_chat == 0:
                 username = getattr(dialog.entity, 'username', None)
@@ -401,9 +430,12 @@ class Scanner:
         result = {
             'dialogs': len(dialogs),
             'checked': total_checked,
+            'video_found': total_video_found,
             'matched': total_matched,
             'forwarded': total_forwarded,
             'skipped_already_forwarded': total_skipped,
+            'reject_reasons': reject_reasons,
+            'top_chats': sorted(per_chat_stats, key=lambda x: (x['matched'], x['forwarded'], x['checked']), reverse=True)[:10],
             'errors': total_errors,
             'empty_chats_count': len(empty_chats),
             'empty_chats': empty_chats,

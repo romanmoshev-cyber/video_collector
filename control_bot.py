@@ -41,6 +41,7 @@ def _mode_label(mode: str) -> str:
         'all': 'всё',
         'month': 'месяц',
         'week': 'неделя',
+        'day': 'сутки',
         'new': 'только новые',
     }
     return labels.get(mode, mode)
@@ -88,14 +89,39 @@ def _main_kb(is_scanning: bool):
     return kb.as_markup()
 
 
+def _status_text(st: UserState, heartbeat: Heartbeat, is_scanning: bool) -> str:
+    msg = (
+        '📄 <b>Статус</b>\n'
+        f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
+        f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
+        f'Выбрано чатов: <b>{len(st.selected_chats)}</b>\n'
+        f'Скан сейчас: <b>{"да" if is_scanning else "нет"}</b>\n'
+        f'Heartbeat age: <b>{heartbeat.age():.1f} сек</b>'
+    )
+    if st.last_run_at:
+        msg += f'\nПоследний запуск: <b>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.last_run_at))}</b>'
+    return msg
+
+
+def _help_text() -> str:
+    return (
+        'ℹ️ <b>Команды</b>\n'
+        '/start — открыть главное меню.\n'
+        '/status — показать состояние процесса и heartbeat.\n'
+        '/help — краткая справка.\n\n'
+        'Главный сценарий: выбери период, выбери чаты или запусти поиск по всем, затем смотри отчёт. '
+        'Для безопасной проверки удаления пустых чатов включи <code>DRY_RUN_DELETE=true</code>.'
+    )
+
+
 def _mode_kb(current: str):
-    items = [('all', 'Всё'), ('month', 'Месяц'), ('week', 'Неделя'), ('new', 'Новые')]
+    items = [('all', 'Всё'), ('month', 'Месяц'), ('week', 'Неделя'), ('day', 'Сутки'), ('new', 'Новые')]
     kb = InlineKeyboardBuilder()
     for code, label in items:
         mark = '✅ ' if code == current else ''
         kb.button(text=f'{mark}{label}', callback_data=f'mode:set:{code}')
     kb.button(text='⬅️ Назад', callback_data='back:main')
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -117,7 +143,7 @@ def _pick_text(dialogs: list[dict[str, Any]], selected: set[int], page: int, per
         '📌 <b>Выбор чатов/каналов</b>\n'
         f'Страница: <b>{page + 1} / {pages}</b> · всего: <b>{total}</b>\n'
         f'Выбрано: <b>{len(selected)}</b>\n\n'
-        'Список сделан в 2 колонки, чтобы на экране помещалось больше чатов.'
+        'Список сделан в 2 колонки. Можно быстро выбрать или снять всю текущую страницу.'
     )
 
 
@@ -145,10 +171,13 @@ def _pick_kb(dialogs: list[dict[str, Any]], selected: set[int], page: int, per_p
     if nav_count:
         sizes.append(nav_count)
 
+    kb.button(text='✅ Выбрать страницу', callback_data='pick:page_select')
+    kb.button(text='➖ Снять страницу', callback_data='pick:page_clear')
+    kb.button(text='🔄 Обновить список', callback_data='pick:refresh')
     kb.button(text='🚀 Старт', callback_data='scan:selected')
-    kb.button(text='🧹 Сброс', callback_data='pick:clear')
+    kb.button(text='🧹 Сброс всё', callback_data='pick:clear')
     kb.button(text='⬅️ В меню', callback_data='back:main')
-    sizes.extend([2, 1])
+    sizes.extend([2, 2, 2])
     kb.adjust(*sizes)
     return kb.as_markup()
 
@@ -211,22 +240,63 @@ def _confirm_delete_all_kb():
     return kb.as_markup()
 
 
+def _format_duration(seconds: int | float) -> str:
+    seconds = int(seconds or 0)
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f'{hours}ч {minutes}м {sec}с'
+    if minutes:
+        return f'{minutes}м {sec}с'
+    return f'{sec}с'
+
+
+_REJECT_LABELS = {
+    'not_vertical': 'не вертикальные',
+    'too_short': 'короткие',
+    'too_narrow': 'узкие',
+    'too_small': 'маленький размер',
+}
+
 def _format_report(stats: Optional[dict[str, Any]]) -> str:
     if not stats:
         return 'Отчёта пока нет.'
+
+    reject_reasons = stats.get('reject_reasons') or {}
+    reject_lines = []
+    for key, label in _REJECT_LABELS.items():
+        value = int(reject_reasons.get(key, 0) or 0)
+        if value:
+            reject_lines.append(f'  • {label}: <b>{value}</b>')
+
+    top_lines = []
+    for item in (stats.get('top_chats') or [])[:5]:
+        if not item.get('matched') and not item.get('forwarded'):
+            continue
+        name = _short_title(str(item.get('name') or item.get('id') or '—'), limit=24)
+        top_lines.append(
+            f'  • {escape(name)}: подошло <b>{item.get("matched", 0)}</b>, '
+            f'форвард <b>{item.get("forwarded", 0)}</b>'
+        )
+
     lines = [
         '📊 <b>Отчёт сканирования</b>',
         f'Чатов: <b>{stats.get("dialogs", 0)}</b>',
         f'Проверено сообщений: <b>{stats.get("checked", 0)}</b>',
+        f'Видео найдено: <b>{stats.get("video_found", stats.get("matched", 0))}</b>',
         f'Подошло видео: <b>{stats.get("matched", 0)}</b>',
         f'Форварднуто: <b>{stats.get("forwarded", 0)}</b>',
         f'Пропущено как дубль: <b>{stats.get("skipped_already_forwarded", 0)}</b>',
         f'Ошибок: <b>{stats.get("errors", 0)}</b>',
         f'Пустых каналов/групп: <b>{stats.get("empty_chats_count", 0)}</b>',
         f'Список пустых обновлён: <b>{"да" if stats.get("empty_chats_updated") else "нет"}</b>',
-        f'Время: <b>{stats.get("elapsed_sec", 0)} сек</b>',
+        f'Время: <b>{_format_duration(stats.get("elapsed_sec", 0))}</b>',
         'Статус: ⛔ остановлено' if stats.get('cancelled') else 'Статус: ✅ завершено',
     ]
+    if reject_lines:
+        lines.extend(['', '🚫 <b>Почему видео не подошли</b>', *reject_lines])
+    if top_lines:
+        lines.extend(['', '🏆 <b>Лучшие чаты</b>', *top_lines])
     return '\n'.join(lines)
 
 
@@ -277,6 +347,19 @@ async def run_control_bot(
         st = await get_state(m.from_user.id)
         heartbeat.beat(status='menu_open', user_id=m.from_user.id)
         await m.answer(_main_text(st, scan_lock.locked()), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+
+    @dp.message(F.text == '/help')
+    async def help_command(m: Message):
+        if not _is_allowed(m.from_user.id, allowed_users):
+            return
+        await m.answer(_help_text(), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+
+    @dp.message(F.text == '/status')
+    async def status_command(m: Message):
+        if not _is_allowed(m.from_user.id, allowed_users):
+            return
+        st = await get_state(m.from_user.id)
+        await m.answer(_status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
 
     @dp.callback_query(F.data == 'back:main')
     async def back_main(c: CallbackQuery):
@@ -368,13 +451,53 @@ async def run_control_bot(
         )
         await c.answer('Очищено')
 
+    @dp.callback_query(F.data == 'pick:refresh')
+    async def pick_refresh(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        await c.answer('Обновляю список…', show_alert=False)
+        old_selected = set(st.selected_chats)
+        st.dialogs_cache = await scanner.list_dialogs()
+        st.dialogs_cache.sort(key=lambda x: (x.get('name') or '').lower())
+        existing_ids = {int(x['id']) for x in st.dialogs_cache}
+        st.selected_chats.intersection_update(existing_ids)
+        st.page = 0
+        removed = len(old_selected) - len(st.selected_chats)
+        await safe_edit_text(
+            c.message,
+            _pick_text(st.dialogs_cache, st.selected_chats, st.page) + (f'\n\nУбрано недоступных выбранных: <b>{removed}</b>' if removed else ''),
+            reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page),
+        )
+
+    @dp.callback_query(F.data.in_({'pick:page_select', 'pick:page_clear'}))
+    async def pick_page_bulk(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        start = st.page * 20
+        page_ids = {int(x['id']) for x in st.dialogs_cache[start:start + 20]}
+        if c.data == 'pick:page_select':
+            st.selected_chats.update(page_ids)
+            answer = f'Выбрано на странице: {len(page_ids)}'
+        else:
+            st.selected_chats.difference_update(page_ids)
+            answer = f'Снято на странице: {len(page_ids)}'
+        await safe_edit_text(
+            c.message,
+            _pick_text(st.dialogs_cache, st.selected_chats, st.page),
+            reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page),
+        )
+        await c.answer(answer)
+
     @dp.callback_query(F.data.startswith('pick:page:'))
     async def pick_page(c: CallbackQuery):
         if not _is_allowed(c.from_user.id, allowed_users):
             return
         st = await get_state(c.from_user.id)
         direction = c.data.split(':')[-1]
-        if direction == 'next':
+        pages = max(1, (len(st.dialogs_cache) + 19) // 20)
+        if direction == 'next' and st.page + 1 < pages:
             st.page += 1
         elif direction == 'prev' and st.page > 0:
             st.page -= 1
@@ -391,17 +514,7 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         await c.answer()
-        msg = (
-            '📄 <b>Статус</b>\n'
-            f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
-            f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
-            f'Выбрано чатов: <b>{len(st.selected_chats)}</b>\n'
-            f'Скан сейчас: <b>{"да" if scan_lock.locked() else "нет"}</b>\n'
-            f'Heartbeat age: <b>{heartbeat.age():.1f} сек</b>'
-        )
-        if st.last_run_at:
-            msg += f'\nПоследний запуск: <b>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.last_run_at))}</b>'
-        await safe_edit_text(c.message, msg, reply_markup=_main_kb(scan_lock.locked()))
+        await safe_edit_text(c.message, _status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
 
     @dp.callback_query(F.data == 'report:last')
     async def report_last(c: CallbackQuery):
@@ -483,6 +596,8 @@ async def run_control_bot(
         if ok:
             await scanner.forget_empty_chat(chat_id)
             empty = await scanner.get_saved_empty_chats()
+            if st.last_stats is None:
+                st.last_stats = {}
             st.last_stats['empty_chats'] = empty
             st.last_stats['empty_chats_count'] = len(empty)
             if st.last_empty_page >= len(st.last_stats['empty_chats']) and st.last_empty_page > 0:
@@ -593,7 +708,7 @@ async def run_control_bot(
         await c.answer('Запускаю…')
 
         progress_msg = await c.message.answer(
-            f'{title}\nПериод: <b>{escape(st.mode)}</b>\nПорядок: <b>{escape(st.order)}</b>\nСтатус: старт…',
+            f'{title}\nПериод: <b>{escape(_mode_label(st.mode))}</b>\nПорядок: <b>{escape(_order_label(st.order))}</b>\nСтатус: старт…',
             disable_web_page_preview=True,
         )
 
@@ -636,8 +751,8 @@ async def run_control_bot(
             fw_line = f'\n⏳ FloodWait: <b>{state["floodwait"]} сек</b>' if state['floodwait'] else ''
             text = (
                 f'{title}\n'
-                f'Период: <b>{escape(st.mode)}</b>\n'
-                f'Порядок: <b>{escape(st.order)}</b>\n'
+                f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
+                f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
                 f'Чаты: <b>{state["chat_index"]} / {state["dialogs_total"]}</b>\n'
                 f'Текущий: <b>{escape(str(state["chat_name"]))}</b>\n'
                 f'Проверено: <b>{state["checked"]}</b>\n'
