@@ -100,6 +100,12 @@ def _should_scan_dialog(dialog: Dialog) -> bool:
 
 
 EMPTY_CHATS_KEY = 'empty_chats:last_full_scan'
+CONNECTION_RECOVERY_ATTEMPTS = 3
+CONNECTION_RECOVERY_BASE_DELAY_SEC = 2.0
+
+
+def _is_connection_error(error: BaseException) -> bool:
+    return isinstance(error, (ConnectionError, OSError))
 
 
 class Scanner:
@@ -128,13 +134,60 @@ class Scanner:
         self.dry_run_delete = dry_run_delete
         self._delete_lock = asyncio.Lock()
 
-    async def list_dialogs(self) -> list[dict[str, Any]]:
-        dialogs: list[dict[str, Any]] = []
+    async def _ensure_connected(self) -> None:
+        if self.client.is_connected():
+            return
+        log.warning('Telethon client is disconnected, reconnecting...')
+        await self.client.connect()
+
+    async def _recover_connection(self, context: str) -> bool:
+        for attempt in range(1, CONNECTION_RECOVERY_ATTEMPTS + 1):
+            try:
+                await self._ensure_connected()
+                await self.client.get_me()
+                log.info('Telethon connection recovered after %s (attempt %s/%s)', context, attempt, CONNECTION_RECOVERY_ATTEMPTS)
+                return True
+            except Exception as e:
+                delay = CONNECTION_RECOVERY_BASE_DELAY_SEC * attempt
+                log.warning(
+                    'Telethon reconnect failed after %s (attempt %s/%s): %s',
+                    context,
+                    attempt,
+                    CONNECTION_RECOVERY_ATTEMPTS,
+                    e.__class__.__name__,
+                )
+                if attempt < CONNECTION_RECOVERY_ATTEMPTS:
+                    await asyncio.sleep(delay)
+        return False
+
+    async def _run_with_connection_recovery(self, context: str, func: Callable[[], Awaitable[Any]]) -> Any:
+        try:
+            await self._ensure_connected()
+            return await func()
+        except Exception as e:
+            if not _is_connection_error(e):
+                raise
+            log.warning('Telethon connection error during %s: %s', context, e.__class__.__name__)
+            if not await self._recover_connection(context):
+                raise
+            return await func()
+
+    async def _collect_dialogs(self, opts: ScanOptions | None = None) -> list[Dialog]:
+        dialogs: list[Dialog] = []
         async for d in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
             if d.id in self.excluded:
                 continue
             if not _should_scan_dialog(d):
                 continue
+            if opts and opts.chat_ids is not None and d.id not in opts.chat_ids:
+                continue
+            dialogs.append(d)
+        return dialogs
+
+    async def list_dialogs(self) -> list[dict[str, Any]]:
+        scan_dialogs = await self._run_with_connection_recovery('list_dialogs', lambda: self._collect_dialogs())
+        dialogs: list[dict[str, Any]] = []
+        for d in scan_dialogs:
             link = None
             username = getattr(d.entity, 'username', None)
             if username:
@@ -191,17 +244,11 @@ class Scanner:
         progress_cb: Optional[ProgressCB] = None,
     ) -> dict[str, Any]:
         start_ts = time.time()
-        target = await self.client.get_entity(self.target_bot_username)
-
-        dialogs: list[Dialog] = []
-        async for d in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
-            if d.id in self.excluded:
-                continue
-            if not _should_scan_dialog(d):
-                continue
-            if opts.chat_ids is not None and d.id not in opts.chat_ids:
-                continue
-            dialogs.append(d)
+        target = await self._run_with_connection_recovery(
+            f'get_entity:{self.target_bot_username}',
+            lambda: self.client.get_entity(self.target_bot_username),
+        )
+        dialogs = await self._run_with_connection_recovery('collect_dialogs', lambda: self._collect_dialogs(opts))
 
         since = _since_dt(opts.mode)
         total_checked = 0
@@ -326,6 +373,13 @@ class Scanner:
                             break
                         await asyncio.sleep(seconds + 1)
                         await self.client.forward_messages(target, msg)
+                    except Exception as e:
+                        if not _is_connection_error(e):
+                            raise
+                        log.warning('Connection error while forwarding chat_id=%s msg_id=%s: %s', chat_id, msg.id, e.__class__.__name__)
+                        if not await self._recover_connection(f'forward chat_id={chat_id} msg_id={msg.id}'):
+                            raise
+                        await self.client.forward_messages(target, msg)
 
                     await self.db.mark_forwarded(chat_id, msg.id, int(time.time()))
                     forwarded_in_chat += 1
@@ -375,12 +429,21 @@ class Scanner:
                 log.exception('RPC error on chat_id=%s', chat_id)
                 if progress_cb:
                     await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'rpc_error'})
-            except Exception:
+            except Exception as e:
                 chat_had_error = True
                 total_errors += 1
-                log.exception('Unexpected error on chat_id=%s', chat_id)
-                if progress_cb:
-                    await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'exception'})
+                if _is_connection_error(e):
+                    log.warning('Connection error on chat_id=%s: %s', chat_id, e.__class__.__name__)
+                    if progress_cb:
+                        await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'connection_error'})
+                    if not await self._recover_connection(f'chat_id={chat_id}'):
+                        cancelled = True
+                        cancel_event.set()
+                        break
+                else:
+                    log.exception('Unexpected error on chat_id=%s', chat_id)
+                    if progress_cb:
+                        await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'exception'})
             finally:
                 if opts.mode == 'new' and chat_finished_cleanly and max_id_seen > min_id:
                     await self.db.set_last_scanned(chat_id, max_id_seen, int(time.time()))
