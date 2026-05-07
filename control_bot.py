@@ -762,15 +762,54 @@ async def run_control_bot(
             )
             await safe_edit_text(progress_msg, text)
 
-        async with scan_lock:
-            st.last_run_at = int(time.time())
-            heartbeat.beat(status='scan_locked', user_id=c.from_user.id)
-            stats = await scanner.scan(opts, cancel_event=cancel_event, progress_cb=progress_cb)
+        origin_message = c.message
+        user_id = c.from_user.id
 
-        st.last_stats = stats
-        st.last_empty_page = 0
-        tail = '\n⛔ <b>Остановлено</b>' if stats.get('cancelled') else '\n✅ <b>Завершено</b>'
-        await safe_edit_text(progress_msg, _format_report(stats) + tail)
-        await c.message.answer(_main_text(st, False), reply_markup=_main_kb(is_scanning=False))
+        await scan_lock.acquire()
+
+        async def run_scan_task() -> None:
+            try:
+                st.last_run_at = int(time.time())
+                heartbeat.beat(status='scan_locked', user_id=user_id)
+                stats = await scanner.scan(opts, cancel_event=cancel_event, progress_cb=progress_cb)
+            except asyncio.CancelledError:
+                heartbeat.beat(status='scan_task_cancelled', user_id=user_id)
+                raise
+            except Exception as e:
+                log.exception('scan task failed')
+                stats = {
+                    'dialogs': state['dialogs_total'],
+                    'checked': state['checked'],
+                    'video_found': 0,
+                    'matched': state['matched'],
+                    'forwarded': state['forwarded'],
+                    'skipped_already_forwarded': 0,
+                    'reject_reasons': {},
+                    'top_chats': [],
+                    'errors': 1,
+                    'empty_chats_count': 0,
+                    'empty_chats_updated': False,
+                    'cancelled': True,
+                    'elapsed_sec': int(time.time() - st.last_run_at) if st.last_run_at else 0,
+                }
+                heartbeat.beat(status='scan_failed', user_id=user_id, error=e.__class__.__name__)
+                try:
+                    await progress_msg.answer(f'❌ Скан упал с ошибкой: <code>{escape(e.__class__.__name__)}</code>')
+                except Exception:
+                    log.exception('failed to notify about scan failure')
+            finally:
+                if scan_lock.locked():
+                    scan_lock.release()
+
+            st.last_stats = stats
+            st.last_empty_page = 0
+            tail = '\n⛔ <b>Остановлено</b>' if stats.get('cancelled') else '\n✅ <b>Завершено</b>'
+            await safe_edit_text(progress_msg, _format_report(stats) + tail)
+            try:
+                await origin_message.answer(_main_text(st, False), reply_markup=_main_kb(is_scanning=False))
+            except Exception:
+                log.exception('failed to send menu after scan')
+
+        asyncio.create_task(run_scan_task(), name=f'video-collector-scan-{user_id}')
 
     await dp.start_polling(bot, polling_timeout=10, handle_as_tasks=True, close_bot_session=True)

@@ -254,17 +254,21 @@ class Scanner:
                 })
 
             try:
+                last_heartbeat_at = 0.0
                 async for msg in self.client.iter_messages(chat_id, limit=limit, min_id=min_id, reverse=reverse):
-                    self.heartbeat.beat(
-                        status='scan_message',
-                        chat_id=chat_id,
-                        chat_name=dialog_name,
-                        chat_index=idx,
-                        dialogs_total=len(dialogs),
-                        checked=total_checked,
-                        matched=total_matched,
-                        forwarded=total_forwarded,
-                    )
+                    now_monotonic = time.monotonic()
+                    if checked_in_chat == 0 or now_monotonic - last_heartbeat_at >= 5.0:
+                        last_heartbeat_at = now_monotonic
+                        self.heartbeat.beat(
+                            status='scan_message',
+                            chat_id=chat_id,
+                            chat_name=dialog_name,
+                            chat_index=idx,
+                            dialogs_total=len(dialogs),
+                            checked=total_checked,
+                            matched=total_matched,
+                            forwarded=total_forwarded,
+                        )
 
                     if cancel_event.is_set():
                         cancelled = True
