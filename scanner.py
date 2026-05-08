@@ -100,6 +100,7 @@ def _should_scan_dialog(dialog: Dialog) -> bool:
 
 
 EMPTY_CHATS_KEY = 'empty_chats:last_full_scan'
+EXCLUDED_CHATS_KEY = 'excluded_chats:manual'
 CONNECTION_RECOVERY_ATTEMPTS = 3
 CONNECTION_RECOVERY_BASE_DELAY_SEC = 2.0
 
@@ -173,6 +174,8 @@ class Scanner:
             return await func()
 
     async def _collect_dialogs(self, opts: ScanOptions | None = None) -> list[Dialog]:
+        for item in await self.db.kv_get_json(EXCLUDED_CHATS_KEY, []):
+            self.excluded.add(int(item.get('id', 0)))
         dialogs: list[Dialog] = []
         async for d in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
             if d.id in self.excluded:
@@ -211,9 +214,52 @@ class Scanner:
     async def save_empty_chats(self, empty_chats: list[dict[str, Any]]) -> None:
         await self.db.kv_set_json(EMPTY_CHATS_KEY, empty_chats)
 
+    async def update_empty_chats(self, empty_chats: list[dict[str, Any]], non_empty_chat_ids: set[int], replace: bool) -> None:
+        if replace:
+            await self.save_empty_chats(empty_chats)
+            return
+        saved = await self.get_saved_empty_chats()
+        by_id = {int(item.get('id', 0)): item for item in saved}
+        for chat_id in non_empty_chat_ids:
+            by_id.pop(int(chat_id), None)
+        for item in empty_chats:
+            by_id[int(item['id'])] = item
+        await self.save_empty_chats(sorted(by_id.values(), key=lambda x: (str(x.get('name') or '').casefold(), int(x.get('id', 0)))))
+
     async def forget_empty_chat(self, chat_id: int) -> None:
         empty_chats = await self.get_saved_empty_chats()
         await self.save_empty_chats([x for x in empty_chats if int(x.get('id', 0)) != chat_id])
+
+    async def get_excluded_chats(self) -> list[dict[str, Any]]:
+        saved = await self.db.kv_get_json(EXCLUDED_CHATS_KEY, [])
+        configured = [{'id': chat_id, 'name': f'ID {chat_id}', 'source': 'config'} for chat_id in sorted(self.excluded)]
+        by_id = {int(item['id']): item for item in configured}
+        for item in saved:
+            by_id[int(item['id'])] = item
+        return sorted(by_id.values(), key=lambda x: (str(x.get('name') or '').casefold(), int(x.get('id', 0))))
+
+    async def exclude_chat(self, chat: dict[str, Any]) -> None:
+        chat_id = int(chat['id'])
+        self.excluded.add(chat_id)
+        saved = await self.db.kv_get_json(EXCLUDED_CHATS_KEY, [])
+        by_id = {int(item['id']): item for item in saved}
+        by_id[chat_id] = {
+            'id': chat_id,
+            'name': chat.get('name') or str(chat_id),
+            'link': chat.get('link'),
+            'excluded_at': int(time.time()),
+            'source': 'manual',
+        }
+        await self.db.kv_set_json(EXCLUDED_CHATS_KEY, sorted(by_id.values(), key=lambda x: (str(x.get('name') or '').casefold(), int(x.get('id', 0)))))
+        await self.forget_empty_chat(chat_id)
+
+    async def restore_excluded_chat(self, chat_id: int) -> None:
+        self.excluded.discard(int(chat_id))
+        saved = await self.db.kv_get_json(EXCLUDED_CHATS_KEY, [])
+        await self.db.kv_set_json(EXCLUDED_CHATS_KEY, [x for x in saved if int(x.get('id', 0)) != int(chat_id)])
+
+    async def get_period_report(self, period: str) -> list[dict[str, Any]]:
+        return await self.db.get_chat_stats(period)
 
     async def delete_dialog_by_id(self, chat_id: int) -> tuple[bool, str]:
         async with self._delete_lock:
@@ -261,7 +307,8 @@ class Scanner:
         per_chat_stats: list[dict[str, Any]] = []
         cancelled = False
         empty_chats: list[dict[str, Any]] = []
-        can_update_empty_list = opts.mode == 'all' and opts.chat_ids is None
+        non_empty_chat_ids: set[int] = set()
+        can_replace_empty_list = opts.mode == 'all' and opts.chat_ids is None
 
         if progress_cb:
             await progress_cb({'type': 'init', 'dialogs_total': len(dialogs), 'mode': opts.mode, 'order': opts.order})
@@ -283,6 +330,7 @@ class Scanner:
             checked_in_chat = 0
             matched_in_chat = 0
             forwarded_in_chat = 0
+            video_found_in_chat = 0
             hard_stopped_by_date = False
             chat_had_error = False
             chat_finished_cleanly = False
@@ -346,6 +394,7 @@ class Scanner:
                         continue
 
                     total_video_found += 1
+                    video_found_in_chat += 1
                     w, h, duration, size = meta
                     reject_reason = _reject_reason(w, h, duration, size)
                     if reject_reason:
@@ -455,11 +504,16 @@ class Scanner:
                         'name': dialog_name,
                         'checked': checked_in_chat,
                         'matched': matched_in_chat,
+                        'video_found': video_found_in_chat,
                         'forwarded': forwarded_in_chat,
+                        'link': f'https://t.me/{getattr(dialog.entity, "username", None)}' if getattr(dialog.entity, 'username', None) else None,
                     }
                 )
 
-            if can_update_empty_list and not cancelled and not chat_had_error and matched_in_chat == 0:
+            if not chat_had_error and matched_in_chat > 0:
+                non_empty_chat_ids.add(chat_id)
+
+            if not chat_had_error and matched_in_chat == 0:
                 username = getattr(dialog.entity, 'username', None)
                 link = f'https://t.me/{username}' if username else None
                 empty_chats.append(
@@ -470,6 +524,7 @@ class Scanner:
                         'username': username,
                         'checked': checked_in_chat,
                         'matched': matched_in_chat,
+                        'video_found': video_found_in_chat,
                         'forwarded': forwarded_in_chat,
                         'by_date_stop': hard_stopped_by_date,
                         'is_group': bool(dialog.is_group),
@@ -505,13 +560,13 @@ class Scanner:
             'top_chats': sorted(per_chat_stats, key=lambda x: (x['matched'], x['forwarded'], x['checked']), reverse=True)[:10],
             'errors': total_errors,
             'empty_chats_count': len(empty_chats),
-            'empty_chats_updated': bool(can_update_empty_list and not cancelled and total_errors == 0),
+            'empty_chats_updated': bool(empty_chats or non_empty_chat_ids),
             'cancelled': cancelled,
             'elapsed_sec': elapsed,
         }
 
-        if can_update_empty_list and not cancelled and total_errors == 0:
-            await self.save_empty_chats(empty_chats)
+        await self.update_empty_chats(empty_chats, non_empty_chat_ids, replace=can_replace_empty_list and not cancelled)
+        await self.db.upsert_chat_stats(opts.mode, per_chat_stats, int(time.time()))
 
         result_summary = {k: result[k] for k in ('dialogs', 'checked', 'matched', 'forwarded', 'errors', 'empty_chats_count', 'cancelled', 'elapsed_sec')}
         log.info('Scan finish: %s', result_summary)
