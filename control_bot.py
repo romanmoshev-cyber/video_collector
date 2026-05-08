@@ -30,6 +30,9 @@ class UserState:
     last_stats: Optional[dict[str, Any]] = None
     last_run_at: Optional[int] = None
     last_empty_page: int = 0
+    report_period: str = 'all'
+    report_page: int = 0
+    excluded_page: int = 0
 
 
 def _is_allowed(user_id: int, allowed: set[int]) -> bool:
@@ -78,14 +81,15 @@ def _main_kb(is_scanning: bool):
     kb.button(text='📌 Выбрать', callback_data='pick:open')
     kb.button(text='⏱ Период', callback_data='mode:open')
     kb.button(text='🔁 Порядок', callback_data='order:open')
-    kb.button(text='📊 Отчёт', callback_data='report:last')
+    kb.button(text='📊 Отчёты', callback_data='reports:menu')
     kb.button(text='🧹 Пустые', callback_data='empty:list')
+    kb.button(text='🚫 Исключения', callback_data='excluded:list')
     kb.button(text='📄 Статус', callback_data='status')
     if is_scanning:
         kb.button(text='⛔ Стоп', callback_data='scan:stop')
-        kb.adjust(2, 2, 2, 2)
+        kb.adjust(2, 2, 2, 2, 1)
     else:
-        kb.adjust(2, 2, 2, 1)
+        kb.adjust(2, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -193,6 +197,7 @@ def _empty_item_text(item: dict[str, Any], page: int, total: int) -> str:
         f'<b>Тип:</b> {peer_type}\n'
         f'<b>Проверено сообщений:</b> {item.get("checked", 0)}\n'
         f'<b>Подошло:</b> {item.get("matched", 0)}\n'
+        f'<b>Видео найдено:</b> {item.get("video_found", 0)}\n'
         f'<b>Форварднуто:</b> {item.get("forwarded", 0)}\n'
         f'{link_line}'
     )
@@ -203,6 +208,7 @@ def _empty_item_kb(item: dict[str, Any], page: int, total: int):
     if item.get('link'):
         kb.button(text='🔗 Открыть', url=item['link'])
     kb.button(text='🗑 Удалить/выйти', callback_data=f'empty:delete:confirm:{item["id"]}')
+    kb.button(text='🚫 Исключить', callback_data=f'empty:exclude:{item["id"]}')
     kb.button(text='❌ Убрать из списка', callback_data=f'empty:forget:{item["id"]}')
     kb.button(text='🧨 Удалить/выйти из всех', callback_data='empty:delete_all:confirm')
 
@@ -215,7 +221,7 @@ def _empty_item_kb(item: dict[str, Any], page: int, total: int):
     sizes = []
     if item.get('link'):
         sizes.append(1)
-    sizes.extend([2, 1])
+    sizes.extend([2, 2])
     nav_count = int(page > 0) + int(page + 1 < total)
     if nav_count:
         sizes.append(nav_count)
@@ -300,6 +306,130 @@ def _format_report(stats: Optional[dict[str, Any]]) -> str:
     return '\n'.join(lines)
 
 
+_REPORT_PERIODS = [('all', 'Всё'), ('month', 'Месяц'), ('week', 'Неделя'), ('day', 'Сутки')]
+_REPORT_PAGE_SIZE = 8
+
+
+def _reports_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text='📌 Последний отчёт', callback_data='report:last')
+    for code, label in _REPORT_PERIODS:
+        kb.button(text=f'📊 {label}', callback_data=f'report:view:{code}:0')
+    kb.button(text='🚫 Исключения', callback_data='excluded:list')
+    kb.button(text='⬅️ В меню', callback_data='back:main')
+    kb.adjust(1, 2, 2, 1, 1)
+    return kb.as_markup()
+
+
+def _reports_menu_text() -> str:
+    return (
+        '📊 <b>Отчёты</b>\n\n'
+        'Здесь есть последний общий отчёт и отдельные списки по периодам: всё, месяц, неделя, сутки. '
+        'В строках отчёта название кликабельное, а ниже есть кнопки удаления и исключения.'
+    )
+
+
+def _report_rows_text(period: str, rows: list[dict[str, Any]], page: int) -> str:
+    total = len(rows)
+    pages = max(1, (total + _REPORT_PAGE_SIZE - 1) // _REPORT_PAGE_SIZE)
+    start = page * _REPORT_PAGE_SIZE
+    chunk = rows[start:start + _REPORT_PAGE_SIZE]
+    total_video = sum(int(x.get('video_found', 0) or 0) for x in rows)
+    total_matched = sum(int(x.get('matched', 0) or 0) for x in rows)
+    total_checked = sum(int(x.get('checked', 0) or 0) for x in rows)
+    lines = [
+        f'📊 <b>Отчёт: {escape(_mode_label(period))}</b>',
+        f'Страница: <b>{page + 1} / {pages}</b> · чатов: <b>{total}</b>',
+        f'Проверено сообщений: <b>{total_checked}</b>',
+        f'Видео: <b>{total_video}</b> · подошло: <b>{total_matched}</b>',
+        '',
+    ]
+    if not rows:
+        lines.append('Данных пока нет. Запусти сканирование за этот период, и бот сохранит статистику по каждому чату.')
+        return '\n'.join(lines)
+    for num, item in enumerate(chunk, start=start + 1):
+        name = escape(str(item.get('name') or item.get('id') or '—'))
+        if item.get('link'):
+            title = f'<a href="{escape(item["link"])}">{name}</a>'
+        else:
+            title = name
+        lines.append(
+            f'{num}. {title}\n'
+            f'   видео: <b>{item.get("video_found", 0)}</b> · подошло: <b>{item.get("matched", 0)}</b> · '
+            f'форвард: <b>{item.get("forwarded", 0)}</b> · сообщений: <b>{item.get("checked", 0)}</b>'
+        )
+    return '\n'.join(lines)
+
+
+def _report_rows_kb(period: str, rows: list[dict[str, Any]], page: int):
+    kb = InlineKeyboardBuilder()
+    start = page * _REPORT_PAGE_SIZE
+    chunk = rows[start:start + _REPORT_PAGE_SIZE]
+    for offset, item in enumerate(chunk, start=1):
+        num = start + offset
+        chat_id = int(item['id'])
+        kb.button(text=f'🗑 {num}', callback_data=f'report:delete:confirm:{period}:{page}:{chat_id}')
+        kb.button(text=f'🚫 {num}', callback_data=f'report:exclude:{period}:{page}:{chat_id}')
+    sizes = [2] * len(chunk)
+    nav_count = 0
+    if page > 0:
+        kb.button(text='⬅️', callback_data=f'report:view:{period}:{page - 1}')
+        nav_count += 1
+    if start + _REPORT_PAGE_SIZE < len(rows):
+        kb.button(text='➡️', callback_data=f'report:view:{period}:{page + 1}')
+        nav_count += 1
+    if nav_count:
+        sizes.append(nav_count)
+    kb.button(text='⬅️ Отчёты', callback_data='reports:menu')
+    kb.button(text='🏠 Меню', callback_data='back:main')
+    sizes.append(2)
+    kb.adjust(*sizes)
+    return kb.as_markup()
+
+
+def _excluded_text(items: list[dict[str, Any]], page: int) -> str:
+    total = len(items)
+    pages = max(1, (total + _REPORT_PAGE_SIZE - 1) // _REPORT_PAGE_SIZE)
+    start = page * _REPORT_PAGE_SIZE
+    chunk = items[start:start + _REPORT_PAGE_SIZE]
+    lines = [f'🚫 <b>Исключённые чаты</b>', f'Страница: <b>{page + 1} / {pages}</b> · всего: <b>{total}</b>', '']
+    if not items:
+        lines.append('Список пуст. Нажимай «Исключить» в отчётах или списке пустых, чтобы чат больше не проверялся.')
+        return '\n'.join(lines)
+    for num, item in enumerate(chunk, start=start + 1):
+        name = escape(str(item.get('name') or item.get('id') or '—'))
+        if item.get('link'):
+            title = f'<a href="{escape(item["link"])}">{name}</a>'
+        else:
+            title = name
+        lines.append(f'{num}. {title} · <code>{item.get("id")}</code>')
+    return '\n'.join(lines)
+
+
+def _excluded_kb(items: list[dict[str, Any]], page: int):
+    kb = InlineKeyboardBuilder()
+    start = page * _REPORT_PAGE_SIZE
+    chunk = items[start:start + _REPORT_PAGE_SIZE]
+    for offset, item in enumerate(chunk, start=1):
+        num = start + offset
+        kb.button(text=f'↩️ Вернуть {num}', callback_data=f'excluded:restore:{page}:{int(item["id"])}')
+    sizes = [1] * len(chunk)
+    nav_count = 0
+    if page > 0:
+        kb.button(text='⬅️', callback_data=f'excluded:page:{page - 1}')
+        nav_count += 1
+    if start + _REPORT_PAGE_SIZE < len(items):
+        kb.button(text='➡️', callback_data=f'excluded:page:{page + 1}')
+        nav_count += 1
+    if nav_count:
+        sizes.append(nav_count)
+    kb.button(text='⬅️ Отчёты', callback_data='reports:menu')
+    kb.button(text='🏠 Меню', callback_data='back:main')
+    sizes.append(2)
+    kb.adjust(*sizes)
+    return kb.as_markup()
+
+
 async def run_control_bot(
     bot_token: str,
     allowed_users: set[int],
@@ -339,6 +469,21 @@ async def run_control_bot(
         st.last_empty_page = max(0, min(st.last_empty_page, len(empty) - 1))
         item = empty[st.last_empty_page]
         await safe_edit_text(message, _empty_item_text(item, st.last_empty_page, len(empty)), reply_markup=_empty_item_kb(item, st.last_empty_page, len(empty)))
+
+    async def render_period_report(message: Message, st: UserState, period: str, page: int):
+        rows = await scanner.get_period_report(period)
+        pages = max(1, (len(rows) + _REPORT_PAGE_SIZE - 1) // _REPORT_PAGE_SIZE)
+        page = max(0, min(page, pages - 1))
+        st.report_period = period
+        st.report_page = page
+        await safe_edit_text(message, _report_rows_text(period, rows, page), reply_markup=_report_rows_kb(period, rows, page))
+
+    async def render_excluded(message: Message, st: UserState, page: int):
+        items = await scanner.get_excluded_chats()
+        pages = max(1, (len(items) + _REPORT_PAGE_SIZE - 1) // _REPORT_PAGE_SIZE)
+        page = max(0, min(page, pages - 1))
+        st.excluded_page = page
+        await safe_edit_text(message, _excluded_text(items, page), reply_markup=_excluded_kb(items, page))
 
     @dp.message(F.text == '/start')
     async def start(m: Message):
@@ -516,13 +661,69 @@ async def run_control_bot(
         await c.answer()
         await safe_edit_text(c.message, _status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
 
+    @dp.callback_query(F.data == 'reports:menu')
+    async def reports_menu(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        await c.answer()
+        await safe_edit_text(c.message, _reports_menu_text(), reply_markup=_reports_menu_kb())
+
     @dp.callback_query(F.data == 'report:last')
     async def report_last(c: CallbackQuery):
         if not _is_allowed(c.from_user.id, allowed_users):
             return
         st = await get_state(c.from_user.id)
         await c.answer()
-        await safe_edit_text(c.message, _format_report(st.last_stats), reply_markup=_main_kb(scan_lock.locked()))
+        await safe_edit_text(c.message, _format_report(st.last_stats), reply_markup=_reports_menu_kb())
+
+    @dp.callback_query(F.data.startswith('report:view:'))
+    async def report_view(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        _, _, period, page_raw = c.data.split(':')
+        await render_period_report(c.message, st, period, int(page_raw))
+        await c.answer()
+
+    @dp.callback_query(F.data.startswith('report:exclude:'))
+    async def report_exclude(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        _, _, period, page_raw, chat_id_raw = c.data.split(':')
+        rows = await scanner.get_period_report(period)
+        chat_id = int(chat_id_raw)
+        item = next((x for x in rows if int(x['id']) == chat_id), {'id': chat_id, 'name': str(chat_id)})
+        await scanner.exclude_chat(item)
+        await render_period_report(c.message, st, period, int(page_raw))
+        await c.answer('Чат исключён из будущих проверок')
+
+    @dp.callback_query(F.data.startswith('report:delete:confirm:'))
+    async def report_delete_confirm(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        _, _, _, period, page_raw, chat_id_raw = c.data.split(':')
+        text = (
+            '⚠️ <b>Подтверди удаление/выход</b>\n\n'
+            f'ID: <code>{int(chat_id_raw)}</code>\n\n'
+            'Это удалит диалог из аккаунта и выйдет из канала/группы, если Telegram это разрешает.'
+        )
+        kb = InlineKeyboardBuilder()
+        kb.button(text='✅ Да, удалить/выйти', callback_data=f'report:delete:do:{period}:{page_raw}:{chat_id_raw}')
+        kb.button(text='↩️ Отмена', callback_data=f'report:view:{period}:{page_raw}')
+        kb.adjust(2)
+        await safe_edit_text(c.message, text, reply_markup=kb.as_markup())
+        await c.answer()
+
+    @dp.callback_query(F.data.startswith('report:delete:do:'))
+    async def report_delete_do(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        _, _, _, period, page_raw, chat_id_raw = c.data.split(':')
+        ok, info = await scanner.delete_dialog_by_id(int(chat_id_raw))
+        await render_period_report(c.message, st, period, int(page_raw))
+        await c.answer('Удалено' if ok else f'Ошибка: {info}', show_alert=not ok)
 
     @dp.callback_query(F.data == 'empty:list')
     async def empty_list(c: CallbackQuery):
@@ -548,6 +749,21 @@ async def run_control_bot(
             st.last_empty_page -= 1
         await render_empty_list(c.message, st)
         await c.answer()
+
+    @dp.callback_query(F.data.startswith('empty:exclude:'))
+    async def empty_exclude(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        chat_id = int(c.data.split(':')[-1])
+        empty = await scanner.get_saved_empty_chats()
+        item = next((x for x in empty if int(x.get('id', 0)) == chat_id), {'id': chat_id, 'name': str(chat_id)})
+        await scanner.exclude_chat(item)
+        remaining = await scanner.get_saved_empty_chats()
+        if st.last_empty_page >= len(remaining) and st.last_empty_page > 0:
+            st.last_empty_page -= 1
+        await render_empty_list(c.message, st)
+        await c.answer('Чат исключён из будущих проверок')
 
     @dp.callback_query(F.data.startswith('empty:forget:'))
     async def empty_forget(c: CallbackQuery):
@@ -667,6 +883,33 @@ async def run_control_bot(
             f'✅ Массовое удаление/выход завершено.\nУдалено: <b>{deleted}</b>\nОсталось в списке: <b>{len(remaining)}</b>{fail_text}',
             reply_markup=_main_kb(scan_lock.locked()),
         )
+
+    @dp.callback_query(F.data == 'excluded:list')
+    async def excluded_list(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        await render_excluded(c.message, st, st.excluded_page)
+        await c.answer()
+
+    @dp.callback_query(F.data.startswith('excluded:page:'))
+    async def excluded_page(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        page = int(c.data.split(':')[-1])
+        await render_excluded(c.message, st, page)
+        await c.answer()
+
+    @dp.callback_query(F.data.startswith('excluded:restore:'))
+    async def excluded_restore(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        st = await get_state(c.from_user.id)
+        _, _, page_raw, chat_id_raw = c.data.split(':')
+        await scanner.restore_excluded_chat(int(chat_id_raw))
+        await render_excluded(c.message, st, int(page_raw))
+        await c.answer('Чат возвращён в проверки')
 
     @dp.callback_query(F.data == 'scan:stop')
     async def scan_stop(c: CallbackQuery):
