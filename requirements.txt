@@ -3,3 +3,4 @@ Telethon>=1.42.0,<2.0.0
 python-dotenv>=1.0.1,<2.0.0
 aiosqlite>=0.20.0,<1.0.0
 yt-dlp>=2025.1.15
+imageio-ffmpeg>=0.5.1,<1.0.0

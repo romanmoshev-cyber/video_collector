@@ -111,6 +111,19 @@ def _video_attributes_from_info(info: dict[str, Any]) -> list[DocumentAttributeV
     return None
 
 
+def _find_ffmpeg() -> str | None:
+    system_ffmpeg = shutil.which('ffmpeg')
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    if importlib.util.find_spec('imageio_ffmpeg') is None:
+        return None
+
+    imageio_ffmpeg = importlib.import_module('imageio_ffmpeg')
+    bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    return str(bundled_ffmpeg) if bundled_ffmpeg else None
+
+
 def _sent_message_id(sent: Any) -> int | None:
     if isinstance(sent, list):
         sent = sent[0] if sent else None
@@ -577,14 +590,15 @@ class Scanner:
             _ensure_ytdlp_available()
             yt_dlp = importlib.import_module('yt_dlp')
 
-            ffmpeg_path = shutil.which('ffmpeg')
+            ffmpeg_path = _find_ffmpeg()
             if ffmpeg_path:
                 download_format = 'bestvideo*+bestaudio/best'
                 log.debug('Using ffmpeg for external video merge: %s', ffmpeg_path)
             else:
                 download_format = 'best[ext=mp4]/best'
                 log.warning(
-                    'ffmpeg is not installed; downloading the best single-file stream instead of separate video/audio streams'
+                    'ffmpeg is not installed and bundled imageio-ffmpeg is unavailable; '
+                    'downloading the best single-file stream instead of separate video/audio streams'
                 )
 
             options = {
@@ -603,6 +617,7 @@ class Scanner:
             }
             if ffmpeg_path:
                 options['merge_output_format'] = 'mp4'
+                options['ffmpeg_location'] = ffmpeg_path
             if self.ytdlp_cookies_file:
                 options['cookiefile'] = str(self.ytdlp_cookies_file)
             with yt_dlp.YoutubeDL(options) as ydl:
