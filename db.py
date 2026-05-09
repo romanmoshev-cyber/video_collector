@@ -51,6 +51,21 @@ class DB:
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (period, chat_id)
             );
+
+            CREATE TABLE IF NOT EXISTS link_uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                link TEXT NOT NULL,
+                source_name TEXT NOT NULL,
+                title TEXT,
+                resolution TEXT,
+                size INTEGER NOT NULL DEFAULT 0,
+                duration INTEGER NOT NULL DEFAULT 0,
+                target_message_id INTEGER,
+                status TEXT NOT NULL,
+                error TEXT,
+                elapsed_sec INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
             '''
         )
         await self.conn.commit()
@@ -182,3 +197,62 @@ class DB:
             }
             for row in rows
         ]
+
+    async def add_link_upload(self, row: dict[str, Any]) -> None:
+        assert self.conn is not None
+        await self.conn.execute(
+            """
+            INSERT INTO link_uploads(
+                link, source_name, title, resolution, size, duration, target_message_id, status, error, elapsed_sec, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(row.get('link') or ''),
+                str(row.get('source_name') or row.get('chat_name') or '—'),
+                row.get('title'),
+                row.get('resolution'),
+                int(row.get('size', 0) or 0),
+                int(row.get('duration', 0) or 0),
+                row.get('target_message_id'),
+                str(row.get('status') or 'ok'),
+                row.get('error'),
+                int(row.get('elapsed_sec', 0) or 0),
+                int(row.get('created_at', 0) or 0),
+            ),
+        )
+        await self.conn.commit()
+
+    async def get_link_stats(self) -> dict[str, Any]:
+        assert self.conn is not None
+        async with self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS errors,
+                COALESCE(SUM(CASE WHEN status = 'ok' THEN size ELSE 0 END), 0) AS bytes_uploaded,
+                COALESCE(SUM(CASE WHEN status = 'ok' THEN duration ELSE 0 END), 0) AS duration_sec
+            FROM link_uploads
+            """
+        ) as cur:
+            totals = await cur.fetchone()
+
+        async with self.conn.execute(
+            """
+            SELECT link, source_name, title, resolution, size, duration, target_message_id, status, error, elapsed_sec, created_at
+            FROM link_uploads
+            ORDER BY id DESC
+            LIMIT 10
+            """
+        ) as cur:
+            recent = await cur.fetchall()
+
+        return {
+            'total': int(totals['total'] or 0),
+            'ok': int(totals['ok'] or 0),
+            'errors': int(totals['errors'] or 0),
+            'bytes_uploaded': int(totals['bytes_uploaded'] or 0),
+            'duration_sec': int(totals['duration_sec'] or 0),
+            'recent': [dict(row) for row in recent],
+        }

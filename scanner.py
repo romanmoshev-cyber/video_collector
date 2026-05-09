@@ -45,6 +45,49 @@ def _format_bytes(value: Any) -> str:
     return f'{size:.1f} {units[idx]}'
 
 
+def _video_meta_summary(width: Any, height: Any, duration: Any, size: Any) -> dict[str, Any]:
+    try:
+        w = int(width or 0)
+    except (TypeError, ValueError):
+        w = 0
+    try:
+        h = int(height or 0)
+    except (TypeError, ValueError):
+        h = 0
+    try:
+        d = int(float(duration or 0))
+    except (TypeError, ValueError):
+        d = 0
+    try:
+        file_size = int(size or 0)
+    except (TypeError, ValueError):
+        file_size = 0
+    return {
+        'width': w,
+        'height': h,
+        'resolution': f'{w}×{h}' if w and h else 'неизвестно',
+        'duration': d,
+        'size': file_size,
+        'size_human': _format_bytes(file_size),
+    }
+
+
+def _video_meta_summary_from_info(info: dict[str, Any], file_path: Path) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = [info]
+    for key in ('requested_downloads', 'requested_formats', 'formats'):
+        values = info.get(key)
+        if isinstance(values, list):
+            candidates.extend(item for item in values if isinstance(item, dict))
+
+    width = height = None
+    for item in candidates:
+        width = item.get('width')
+        height = item.get('height')
+        if width and height:
+            break
+    return _video_meta_summary(width, height, info.get('duration'), file_path.stat().st_size)
+
+
 def _make_transfer_progress_callback(
     progress_cb: Optional[ProgressCB],
     event_type: str,
@@ -617,6 +660,12 @@ class Scanner:
             if not downloaded:
                 raise RuntimeError('download_media returned empty path')
             downloaded_path = Path(downloaded)
+            meta = _extract_video_meta(msg)
+            meta_event = _video_meta_summary(meta[0], meta[1], meta[2], downloaded_path.stat().st_size) if meta else {
+                'size': downloaded_path.stat().st_size,
+                'size_human': _format_bytes(downloaded_path.stat().st_size),
+                'resolution': 'неизвестно',
+            }
             if progress_cb:
                 await progress_cb({
                     'type': 'download_done',
@@ -624,10 +673,10 @@ class Scanner:
                     'chat_name': chat_name,
                     'msg_id': msg.id,
                     'local_path': str(downloaded_path),
+                    **meta_event,
                 })
 
             self._ensure_upload_size_allowed(downloaded_path)
-            meta = _extract_video_meta(msg)
             attributes = _video_attributes_from_values(meta[0], meta[1], meta[2]) if meta else None
             if progress_cb:
                 await progress_cb({'type': 'thumbnail_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
@@ -647,9 +696,19 @@ class Scanner:
                     'msg_id': msg.id,
                     'thumb_path': str(thumb) if thumb else None,
                     'thumb_size': thumb.stat().st_size if thumb and thumb.exists() else 0,
+                    'thumb_size_human': _format_bytes(thumb.stat().st_size) if thumb and thumb.exists() else '0 Б',
                 })
             if progress_cb:
-                await progress_cb({'type': 'upload_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
+                await progress_cb({
+                    'type': 'upload_start',
+                    'chat_id': chat_id,
+                    'chat_name': chat_name,
+                    'msg_id': msg.id,
+                    'size': downloaded_path.stat().st_size,
+                    'size_human': _format_bytes(downloaded_path.stat().st_size),
+                    'thumb_path': str(thumb) if thumb else None,
+                    'has_thumbnail': bool(thumb),
+                })
             self.heartbeat.beat(status='upload_start', chat_id=chat_id, msg_id=msg.id)
             sent = await self.client.send_file(
                 target,
@@ -715,8 +774,18 @@ class Scanner:
         progress_cb: Optional[ProgressCB] = None,
     ) -> int:
         self._ensure_upload_size_allowed(file_path)
+        upload_event = {
+            'type': 'upload_start',
+            'source_id': source_id,
+            'chat_name': source_name,
+            'local_path': str(file_path),
+            'size': file_path.stat().st_size,
+            'size_human': _format_bytes(file_path.stat().st_size),
+            'thumb_path': str(thumb) if thumb else None,
+            'has_thumbnail': bool(thumb),
+        }
         if progress_cb:
-            await progress_cb({'type': 'upload_start', 'source_id': source_id, 'chat_name': source_name, 'local_path': str(file_path)})
+            await progress_cb(upload_event)
         self.heartbeat.beat(status='upload_start', source_id=source_id, source_name=source_name)
         sent = await self.client.send_file(
             target,
@@ -858,6 +927,7 @@ class Scanner:
         if not files:
             raise RuntimeError('yt-dlp did not create a video file')
         downloaded_path = max(files, key=lambda path: path.stat().st_size)
+        meta_event = _video_meta_summary_from_info(info, downloaded_path)
         if progress_cb:
             await progress_cb({
                 'type': 'download_done',
@@ -865,6 +935,7 @@ class Scanner:
                 'chat_name': source_name,
                 'local_path': str(downloaded_path),
                 'title': info.get('title'),
+                **meta_event,
             })
         return downloaded_path, info
 
@@ -888,6 +959,7 @@ class Scanner:
                 progress_cb=progress_cb,
             )
             downloaded_size = downloaded_path.stat().st_size
+            meta_summary = _video_meta_summary_from_info(info, downloaded_path)
             attributes = _video_attributes_from_info(info)
             duration = info.get('duration')
             if progress_cb:
@@ -907,6 +979,7 @@ class Scanner:
                     'chat_name': source_name,
                     'thumb_path': str(thumb) if thumb else None,
                     'thumb_size': thumb.stat().st_size if thumb and thumb.exists() else 0,
+                    'thumb_size_human': _format_bytes(thumb.stat().st_size) if thumb and thumb.exists() else '0 Б',
                 })
             target_msg_id = await self._send_local_file_delete_with_retry(
                 target,
@@ -924,7 +997,11 @@ class Scanner:
                 'title': info.get('title'),
                 'extractor': info.get('extractor_key') or info.get('extractor'),
                 'duration': int(info.get('duration') or 0),
+                'width': meta_summary['width'],
+                'height': meta_summary['height'],
+                'resolution': meta_summary['resolution'],
                 'size': downloaded_size,
+                'size_human': meta_summary['size_human'],
                 'target_message_id': target_msg_id,
                 'elapsed_sec': int(time.time() - start_ts),
             }
@@ -958,7 +1035,9 @@ class Scanner:
             'width': w,
             'height': h,
             'duration': duration,
+            'resolution': f'{w}×{h}',
             'size': size,
+            'size_human': _format_bytes(size),
             'target_message_id': target_msg_id,
             'elapsed_sec': int(time.time() - start_ts),
         }
