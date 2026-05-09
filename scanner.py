@@ -137,6 +137,23 @@ def _matches_rules(w: int, h: int, duration: int, size: int) -> bool:
     return _reject_reason(w, h, duration, size) is None
 
 
+def _iter_messages_kwargs(opts: ScanOptions, since: Optional[datetime], min_id: int) -> dict[str, Any]:
+    reverse = opts.order == 'old_to_new'
+    kwargs: dict[str, Any] = {
+        'limit': None,
+        'min_id': min_id,
+        'reverse': reverse,
+    }
+    # Telethon reverses offset_date semantics together with reverse=True:
+    # in normal order it returns messages older than the date, but in
+    # oldest-to-newest order it returns messages newer than the date. Without
+    # this bound, period scans in old_to_new mode walk the entire chat history
+    # before reaching the requested day/week/month window.
+    if since is not None and reverse:
+        kwargs['offset_date'] = since
+    return kwargs
+
+
 def _video_attributes_from_values(width: Any, height: Any, duration: Any) -> list[DocumentAttributeVideo] | None:
     try:
         w = int(width or 0)
@@ -1008,9 +1025,7 @@ class Scanner:
                 break
 
             dialog_name = dialog.name or str(chat_id)
-            limit = None
             min_id = 0
-            reverse = opts.order == 'old_to_new'
             max_id_seen = 0
             checked_in_chat = 0
             matched_in_chat = 0
@@ -1035,7 +1050,8 @@ class Scanner:
 
             try:
                 last_heartbeat_at = 0.0
-                async for msg in self.client.iter_messages(chat_id, limit=limit, min_id=min_id, reverse=reverse):
+                message_iter_kwargs = _iter_messages_kwargs(opts, since, min_id)
+                async for msg in self.client.iter_messages(chat_id, **message_iter_kwargs):
                     now_monotonic = time.monotonic()
                     if checked_in_chat == 0 or now_monotonic - last_heartbeat_at >= 5.0:
                         last_heartbeat_at = now_monotonic
