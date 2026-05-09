@@ -890,6 +890,8 @@ async def run_control_bot(
             last_edit = now
             fw_line = f'\n⏳ FloodWait: <b>{state["floodwait"]} сек</b>' if state['floodwait'] else ''
             msg_line = f'\nСообщение: <b>#{state["msg_id"]}</b>' if state.get('msg_id') else ''
+            media_details_line = _media_details_line(state)
+            media_details_line = f'\n{media_details_line}' if media_details_line else ''
             text = (
                 f'{title}\n'
                 f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
@@ -901,7 +903,7 @@ async def run_control_bot(
                 f'Загружено: <b>{state["forwarded"]}</b>\n'
                 f'Этап: <b>{escape(str(state["stage"]))}</b>'
                 f'{msg_line}'
-                f'{("\n" + _media_details_line(state)) if _media_details_line(state) else ""}'
+                f'{media_details_line}'
                 f'{_transfer_line(state)}'
                 f'{fw_line}'
             )
