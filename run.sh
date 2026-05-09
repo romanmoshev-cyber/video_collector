@@ -6,7 +6,7 @@ VENV_DIR="${VENV_DIR:-${APP_DIR}/venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 REQ_FILE="${APP_DIR}/requirements.txt"
 REQ_STAMP="${VENV_DIR}/.requirements.sha256"
-REQUIRED_MODULES=(aiogram telethon dotenv aiosqlite yt_dlp)
+REQUIRED_MODULES=(aiogram telethon dotenv aiosqlite yt_dlp imageio_ffmpeg)
 
 cd "${APP_DIR}"
 
