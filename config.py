@@ -98,7 +98,7 @@ def load_config() -> Config:
     ytdlp_cookies_raw = os.getenv('YTDLP_COOKIES_FILE', '').strip()
     ytdlp_cookies_file = Path(ytdlp_cookies_raw).resolve() if ytdlp_cookies_raw else None
     max_upload_size_mb = _int('MAX_UPLOAD_SIZE_MB', 1900)
-    min_free_disk_mb = _int('MIN_FREE_DISK_MB', 2048)
+    min_free_disk_mb = _int('MIN_FREE_DISK_MB', 1024)
 
     watchdog_timeout_sec = _int('WATCHDOG_TIMEOUT_SEC', 900)
     watchdog_check_interval_sec = _int('WATCHDOG_CHECK_INTERVAL_SEC', 15)
