@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import logging
 import random
 import re
@@ -17,8 +18,6 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.custom.dialog import Dialog
 from telethon.tl.types import DocumentAttributeVideo, Message
-import yt_dlp
-
 from db import DB
 from watchdog import Heartbeat
 
@@ -483,6 +482,10 @@ class Scanner:
         self.heartbeat.beat(status='download_start', source_id=url, source_name=source_name)
 
         def run_download() -> dict[str, Any]:
+            if importlib.util.find_spec('yt_dlp') is None:
+                raise RuntimeError('Не установлен пакет yt-dlp. Запусти: python3 -m pip install -r requirements.txt')
+            import yt_dlp
+
             if not shutil.which('ffmpeg'):
                 raise RuntimeError('Для скачивания лучшего качества нужен ffmpeg: yt-dlp часто скачивает видео и звук отдельно')
             options = {
