@@ -184,37 +184,44 @@ def _generate_video_thumbnail(video_path: Path, work_dir: Path, source_id: str, 
         duration_sec = float(duration or 0)
     except (TypeError, ValueError):
         duration_sec = 0
-    seek_sec = max(0.0, min(3.0, duration_sec / 3.0)) if duration_sec else 1.0
+    if duration_sec:
+        seek_points = [max(0.0, min(duration_sec - 0.1, duration_sec * part)) for part in (0.2, 0.35, 0.5, 0.7)]
+    else:
+        seek_points = [1.0, 3.0, 5.0]
 
     thumb_path = work_dir / f'{source_id}_thumb.jpg'
     max_size = 20 * 1024
-    for side in (320, 288, 256, 224, 192):
-        for quality in (8, 12, 16, 20, 24, 28, 31):
-            cmd = [
-                ffmpeg_path,
-                '-y',
-                '-ss',
-                f'{seek_sec:.3f}',
-                '-i',
-                str(video_path),
-                '-map',
-                '0:v:0',
-                '-frames:v',
-                '1',
-                '-vf',
-                f'scale={side}:{side}:force_original_aspect_ratio=decrease',
-                '-q:v',
-                str(quality),
-                str(thumb_path),
-            ]
-            completed = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            if completed.returncode != 0 or not thumb_path.exists() or thumb_path.stat().st_size <= 0:
-                continue
-            if thumb_path.stat().st_size <= max_size:
-                return thumb_path
+    last_size = 0
+    for seek_sec in seek_points:
+        for side in (320, 288, 256, 224, 192, 160, 128, 96):
+            for quality in (8, 12, 16, 20, 24, 28, 31):
+                cmd = [
+                    ffmpeg_path,
+                    '-y',
+                    '-ss',
+                    f'{seek_sec:.3f}',
+                    '-i',
+                    str(video_path),
+                    '-map',
+                    '0:v:0',
+                    '-frames:v',
+                    '1',
+                    '-vf',
+                    f'scale={side}:{side}:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuvj420p',
+                    '-q:v',
+                    str(quality),
+                    str(thumb_path),
+                ]
+                completed = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                if completed.returncode != 0 or not thumb_path.exists() or thumb_path.stat().st_size <= 0:
+                    continue
+                last_size = thumb_path.stat().st_size
+                if last_size <= max_size:
+                    log.debug('Generated thumbnail %s (%s bytes, seek %.3fs, side %s)', thumb_path, last_size, seek_sec, side)
+                    return thumb_path
 
     if thumb_path.exists() and thumb_path.stat().st_size > 0:
-        log.warning('Generated thumbnail is too large for Telegram custom cover: %s bytes', thumb_path.stat().st_size)
+        log.warning('Generated thumbnail is too large for Telegram custom cover: %s bytes', last_size or thumb_path.stat().st_size)
     return None
 
 
@@ -535,9 +542,6 @@ class Scanner:
                 })
 
             self._ensure_upload_size_allowed(downloaded_path)
-            if progress_cb:
-                await progress_cb({'type': 'upload_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
-            self.heartbeat.beat(status='upload_start', chat_id=chat_id, msg_id=msg.id)
             meta = _extract_video_meta(msg)
             attributes = _video_attributes_from_values(meta[0], meta[1], meta[2]) if meta else None
             if progress_cb:
@@ -558,6 +562,9 @@ class Scanner:
                     'thumb_path': str(thumb) if thumb else None,
                     'thumb_size': thumb.stat().st_size if thumb and thumb.exists() else 0,
                 })
+            if progress_cb:
+                await progress_cb({'type': 'upload_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
+            self.heartbeat.beat(status='upload_start', chat_id=chat_id, msg_id=msg.id)
             sent = await self.client.send_file(
                 target,
                 downloaded_path,

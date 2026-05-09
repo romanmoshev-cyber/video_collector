@@ -13,7 +13,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, KeyboardButton, Message, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from scanner import ScanOptions, Scanner
@@ -41,6 +41,32 @@ class UserState:
 @dataclass
 class LinkQueueEntry:
     link: str
+
+_MAIN_MENU_LABELS = {
+    'scan_all': '🔎 Все чаты',
+    'pick': '📌 Выбрать',
+    'mode': '⏱ Период',
+    'order': '🔁 Порядок',
+    'reports': '📊 Отчёты',
+    'empty': '🧹 Пустые',
+    'excluded': '🚫 Исключения',
+    'status': '📄 Статус',
+    'stop': '⛔ Стоп',
+    'help': 'ℹ️ Помощь',
+}
+
+
+def _menu_kb(is_scanning: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=_MAIN_MENU_LABELS['scan_all']), KeyboardButton(text=_MAIN_MENU_LABELS['pick'])],
+        [KeyboardButton(text=_MAIN_MENU_LABELS['mode']), KeyboardButton(text=_MAIN_MENU_LABELS['order'])],
+        [KeyboardButton(text=_MAIN_MENU_LABELS['reports']), KeyboardButton(text=_MAIN_MENU_LABELS['empty'])],
+        [KeyboardButton(text=_MAIN_MENU_LABELS['excluded']), KeyboardButton(text=_MAIN_MENU_LABELS['status'])],
+        [KeyboardButton(text=_MAIN_MENU_LABELS['help'])],
+    ]
+    if is_scanning:
+        rows[-1].append(KeyboardButton(text=_MAIN_MENU_LABELS['stop']))
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
 
 def _is_allowed(user_id: int, allowed: set[int]) -> bool:
@@ -79,7 +105,7 @@ def _main_text(st: UserState, is_scanning: bool) -> str:
         f'Период: <b>{escape(_mode_label(st.mode))}</b> · '
         f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
         f'Выбрано чатов: <b>{len(st.selected_chats)}</b>\n\n'
-        'Выбери действие кнопками ниже.'
+        'Основные кнопки закреплены в меню Telegram под полем ввода.'
     )
 
 
@@ -472,7 +498,8 @@ async def run_control_bot(
 
     async def safe_edit_text(message: Message, text: str, reply_markup=None):
         try:
-            await message.edit_text(text, reply_markup=reply_markup, disable_web_page_preview=True)
+            editable_markup = None if isinstance(reply_markup, ReplyKeyboardMarkup) else reply_markup
+            await message.edit_text(text, reply_markup=editable_markup, disable_web_page_preview=True)
         except TelegramBadRequest:
             pass
         except Exception:
@@ -482,9 +509,27 @@ async def run_control_bot(
     link_queue_accepting = False
     link_queue_total = 0
     link_queue_processed = 0
+    link_status_message: Message | None = None
+
+    def link_queue_summary_text(state: dict[str, Any], *, final: bool = False) -> str:
+        status = 'завершена' if final else 'активна'
+        lines = [
+            '🔔 <b>Постоянный статус загрузки</b>',
+            f'Очередь: <b>{status}</b>',
+            f'Видео: <b>{state.get("idx", 0)} / {state.get("total", link_queue_total)}</b>',
+            f'В ожидании: <b>{len(link_queue)}</b>',
+            f'Источник: <b>{escape(str(state.get("chat_name") or "—"))}</b>',
+            f'Этап: <b>{escape(str(state.get("stage") or "старт"))}</b>',
+        ]
+        transfer = _transfer_line(state)
+        if transfer:
+            lines.append(transfer.lstrip('\n'))
+        if state.get('last_added'):
+            lines.append(f'Последнее добавление: <b>{escape(str(state["last_added"]))}</b>')
+        return '\n'.join(lines)
 
     async def process_link_batch(message: Message, links: list[str]) -> None:
-        nonlocal link_queue_accepting, link_queue_total, link_queue_processed
+        nonlocal link_queue_accepting, link_queue_total, link_queue_processed, link_status_message
 
         active_link_queue = link_queue_accepting
         if active_link_queue:
@@ -499,18 +544,27 @@ async def run_control_bot(
                 links_total=link_queue_total,
                 links_pending=pending,
             )
+            if link_status_message is not None:
+                await safe_edit_text(
+                    link_status_message,
+                    '🔔 <b>Постоянный статус загрузки</b>\n'
+                    'Очередь: <b>активна</b>\n'
+                    f'Видео: <b>{link_queue_processed} / {link_queue_total}</b>\n'
+                    f'В ожидании: <b>{pending}</b>\n'
+                    f'Этап: <b>добавлено {len(links)} ссылок, позиции {start_pos}–{link_queue_total}</b>',
+                )
             await message.answer(
                 '➕ <b>Добавлено в очередь</b>\n'
                 f'Добавлено ссылок: <b>{len(links)}</b>\n'
                 f'Позиции: <b>{start_pos}–{link_queue_total}</b>\n'
                 f'Осталось в очереди: <b>{pending}</b>',
                 disable_web_page_preview=True,
-                reply_markup=_main_kb(True),
+                reply_markup=_menu_kb(True),
             )
             return
 
         if scan_lock.locked():
-            await message.answer('Сейчас идёт сканирование. Дождись окончания или нажми ⛔ Стоп.', reply_markup=_main_kb(True))
+            await message.answer('Сейчас идёт сканирование. Дождись окончания или нажми ⛔ Стоп.', reply_markup=_menu_kb(True))
             return
 
         cancel_event.clear()
@@ -520,11 +574,13 @@ async def run_control_bot(
         link_queue_processed = 0
         link_queue_accepting = True
 
-        progress_msg = await message.answer(
-            f'🔗 <b>Очередь ссылок</b>\nНайдено ссылок: <b>{len(links)}</b>\nСтатус: старт…',
-            disable_web_page_preview=True,
-        )
         state = {'idx': 0, 'total': link_queue_total, 'stage': 'старт', 'chat_name': '—'}
+        progress_msg = await message.answer(
+            link_queue_summary_text(state),
+            disable_web_page_preview=True,
+            reply_markup=_menu_kb(True),
+        )
+        link_status_message = progress_msg
         last_edit = 0.0
 
         async def link_progress_cb(ev: dict[str, Any]) -> None:
@@ -566,15 +622,7 @@ async def run_control_bot(
             if now - last_edit < progress_edit_interval_sec and event_type not in {'floodwait', 'local_delete', 'download_done', 'thumbnail_done', 'upload_done'}:
                 return
             last_edit = now
-            await safe_edit_text(
-                progress_msg,
-                '🔗 <b>Очередь ссылок</b>\n'
-                f'Видео: <b>{state["idx"]} / {state["total"]}</b>\n'
-                f'В ожидании: <b>{len(link_queue)}</b>\n'
-                f'Источник: <b>{escape(str(state["chat_name"]))}</b>\n'
-                f'Этап: <b>{escape(str(state["stage"]))}</b>'
-                f'{_transfer_line(state)}',
-            )
+            await safe_edit_text(progress_msg, link_queue_summary_text(state))
 
         await scan_lock.acquire()
 
@@ -594,11 +642,7 @@ async def run_control_bot(
                     state['chat_name'] = '—'
                     await safe_edit_text(
                         progress_msg,
-                        '🔗 <b>Очередь ссылок</b>\n'
-                        f'Видео: <b>{idx} / {link_queue_total}</b>\n'
-                        f'В ожидании: <b>{len(link_queue)}</b>\n'
-                        f'Статус: <b>обрабатываю ссылку</b>\n'
-                        f'Ссылка: <code>{escape(entry.link)}</code>',
+                        link_queue_summary_text(state) + f'\nСсылка: <code>{escape(entry.link)}</code>',
                     )
                     try:
                         result = await scanner.process_video_link(entry.link, progress_cb=link_progress_cb)
@@ -632,7 +676,8 @@ async def run_control_bot(
                     lines.append('❌ <b>Ошибки</b>')
                     for error in errors[:5]:
                         lines.append(f'  • <code>{escape(error[:180])}</code>')
-                await safe_edit_text(progress_msg, '\n'.join(lines), reply_markup=_main_kb(False))
+                state['stage'] = f'готово: успешно {len(results)}, ошибок {len(errors)}'
+                await safe_edit_text(progress_msg, link_queue_summary_text(state, final=True) + '\n\n' + '\n'.join(lines))
             finally:
                 link_queue_accepting = False
                 if scan_lock.locked():
@@ -647,7 +692,7 @@ async def run_control_bot(
         st.last_stats['empty_chats'] = empty
         st.last_stats['empty_chats_count'] = len(empty)
         if not empty:
-            await safe_edit_text(message, 'Список пустых каналов/групп пока пуст.', reply_markup=_main_kb(scan_lock.locked()))
+            await safe_edit_text(message, 'Список пустых каналов/групп пока пуст.', reply_markup=_menu_kb(scan_lock.locked()))
             return
         st.last_empty_page = max(0, min(st.last_empty_page, len(empty) - 1))
         item = empty[st.last_empty_page]
@@ -668,26 +713,217 @@ async def run_control_bot(
         st.excluded_page = page
         await safe_edit_text(message, _excluded_text(items, page), reply_markup=_excluded_kb(items, page))
 
+
+    async def start_scan_task(origin_message: Message, user_id: int, st: UserState, opts: ScanOptions, title: str) -> None:
+        cancel_event.clear()
+        progress_msg = await origin_message.answer(
+            f'{title}\nПериод: <b>{escape(_mode_label(st.mode))}</b>\nПорядок: <b>{escape(_order_label(st.order))}</b>\nСтатус: старт…',
+            disable_web_page_preview=True,
+            reply_markup=_menu_kb(True),
+        )
+
+        last_edit = 0.0
+        state = {
+            'dialogs_total': 0,
+            'chat_index': 0,
+            'checked': 0,
+            'matched': 0,
+            'forwarded': 0,
+            'floodwait': None,
+            'chat_name': '—',
+            'stage': 'старт',
+            'msg_id': None,
+        }
+
+        async def progress_cb(ev: dict[str, Any]):
+            nonlocal last_edit
+            now = time.time()
+            event_type = ev.get('type')
+            stage_labels = {
+                'init': 'готовлю список чатов',
+                'chat_start': 'проверяю чат',
+                'tick': 'читаю сообщения',
+                'download_start': 'скачиваю видео на сервер',
+                'download_progress': 'скачиваю видео на сервер',
+                'download_done': 'скачано, готовлю обложку',
+                'thumbnail_start': 'генерирую обложку',
+                'thumbnail_done': 'обложка готова' if ev.get('thumb_path') else 'обложку создать не удалось',
+                'upload_start': f'загружаю в @{scanner.target_bot_username}',
+                'upload_progress': f'загружаю в @{scanner.target_bot_username}',
+                'upload_done': 'загрузка завершена',
+                'local_delete': 'локальный файл удалён',
+                'forward': 'видео учтено как загруженное',
+                'chat_done': 'чат завершён',
+                'done': 'сканирование завершено',
+                'error': 'ошибка в чате',
+                'floodwait': f'FloodWait {ev.get("seconds", 0)} сек',
+            }
+            state['stage'] = stage_labels.get(event_type, str(event_type or state['stage']))
+            if ev.get('msg_id'):
+                state['msg_id'] = ev.get('msg_id')
+            if event_type == 'init':
+                state['dialogs_total'] = ev.get('dialogs_total', 0)
+            elif event_type == 'chat_start':
+                state['chat_index'] = ev.get('chat_index', 0)
+                state['chat_name'] = ev.get('chat_name', '—')
+                state['msg_id'] = None
+            elif event_type in {'tick', 'forward', 'chat_done', 'done'}:
+                state['checked'] = ev.get('checked', state['checked'])
+                state['matched'] = ev.get('matched', state['matched'])
+                state['forwarded'] = ev.get('forwarded', state['forwarded'])
+                if ev.get('chat_name'):
+                    state['chat_name'] = ev['chat_name']
+            elif event_type == 'floodwait':
+                state['floodwait'] = ev.get('seconds')
+            if ev.get('chat_name'):
+                state['chat_name'] = ev['chat_name']
+            if event_type in {'download_progress', 'upload_progress'}:
+                state['percent'] = ev.get('percent')
+                state['current_human'] = ev.get('current_human')
+                state['total_human'] = ev.get('total_human')
+            elif event_type in {'download_start', 'download_done', 'thumbnail_start', 'thumbnail_done', 'upload_start', 'upload_done', 'local_delete', 'forward', 'chat_done'}:
+                state.pop('percent', None)
+                state.pop('current_human', None)
+                state.pop('total_human', None)
+            heartbeat.beat(
+                status='scan_progress',
+                event_type=event_type,
+                chat_index=state['chat_index'],
+                dialogs_total=state['dialogs_total'],
+                checked=state['checked'],
+                matched=state['matched'],
+                forwarded=state['forwarded'],
+            )
+            if now - last_edit < progress_edit_interval_sec and event_type not in {'done', 'floodwait', 'download_done', 'thumbnail_done', 'upload_done', 'local_delete'}:
+                return
+            last_edit = now
+            fw_line = f'\n⏳ FloodWait: <b>{state["floodwait"]} сек</b>' if state['floodwait'] else ''
+            msg_line = f'\nСообщение: <b>#{state["msg_id"]}</b>' if state.get('msg_id') else ''
+            text = (
+                f'{title}\n'
+                f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
+                f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
+                f'Чаты: <b>{state["chat_index"]} / {state["dialogs_total"]}</b>\n'
+                f'Текущий: <b>{escape(str(state["chat_name"]))}</b>\n'
+                f'Проверено: <b>{state["checked"]}</b>\n'
+                f'Подошло: <b>{state["matched"]}</b>\n'
+                f'Загружено: <b>{state["forwarded"]}</b>\n'
+                f'Этап: <b>{escape(str(state["stage"]))}</b>'
+                f'{msg_line}'
+                f'{_transfer_line(state)}'
+                f'{fw_line}'
+            )
+            await safe_edit_text(progress_msg, text)
+
+        await scan_lock.acquire()
+
+        async def run_scan_task() -> None:
+            try:
+                st.last_run_at = int(time.time())
+                heartbeat.beat(status='scan_locked', user_id=user_id)
+                stats = await scanner.scan(opts, cancel_event=cancel_event, progress_cb=progress_cb)
+            except asyncio.CancelledError:
+                heartbeat.beat(status='scan_task_cancelled', user_id=user_id)
+                raise
+            except Exception as e:
+                log.exception('scan task failed')
+                stats = {
+                    'dialogs': state['dialogs_total'],
+                    'checked': state['checked'],
+                    'video_found': 0,
+                    'matched': state['matched'],
+                    'forwarded': state['forwarded'],
+                    'skipped_already_forwarded': 0,
+                    'reject_reasons': {},
+                    'top_chats': [],
+                    'errors': 1,
+                    'empty_chats_count': 0,
+                    'empty_chats_updated': False,
+                    'cancelled': True,
+                    'elapsed_sec': int(time.time() - st.last_run_at) if st.last_run_at else 0,
+                }
+                heartbeat.beat(status='scan_failed', user_id=user_id, error=e.__class__.__name__)
+                try:
+                    await progress_msg.answer(f'❌ Скан упал с ошибкой: <code>{escape(e.__class__.__name__)}</code>', reply_markup=_menu_kb(False))
+                except Exception:
+                    log.exception('failed to notify about scan failure')
+            finally:
+                if scan_lock.locked():
+                    scan_lock.release()
+            st.last_stats = stats
+            st.last_empty_page = 0
+            tail = '\n⛔ <b>Остановлено</b>' if stats.get('cancelled') else '\n✅ <b>Завершено</b>'
+            await safe_edit_text(progress_msg, _format_report(stats) + tail)
+            try:
+                await origin_message.answer(_main_text(st, False), reply_markup=_menu_kb(is_scanning=False))
+            except Exception:
+                log.exception('failed to send menu after scan')
+
+        asyncio.create_task(run_scan_task(), name=f'video-collector-scan-{user_id}')
+
     @dp.message(F.text == '/start')
     async def start(m: Message):
         if not _is_allowed(m.from_user.id, allowed_users):
             return
         st = await get_state(m.from_user.id)
         heartbeat.beat(status='menu_open', user_id=m.from_user.id)
-        await m.answer(_main_text(st, scan_lock.locked()), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+        await m.answer(_main_text(st, scan_lock.locked()), reply_markup=_menu_kb(is_scanning=scan_lock.locked()))
 
     @dp.message(F.text == '/help')
     async def help_command(m: Message):
         if not _is_allowed(m.from_user.id, allowed_users):
             return
-        await m.answer(_help_text(), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+        await m.answer(_help_text(), reply_markup=_menu_kb(is_scanning=scan_lock.locked()))
 
     @dp.message(F.text == '/status')
     async def status_command(m: Message):
         if not _is_allowed(m.from_user.id, allowed_users):
             return
         st = await get_state(m.from_user.id)
-        await m.answer(_status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
+        await m.answer(_status_text(st, heartbeat, scan_lock.locked()), reply_markup=_menu_kb(scan_lock.locked()))
+
+    @dp.message(F.text.in_(set(_MAIN_MENU_LABELS.values())))
+    async def menu_button_message(m: Message):
+        if not _is_allowed(m.from_user.id, allowed_users):
+            return
+        st = await get_state(m.from_user.id)
+        text = m.text or ''
+        if text == _MAIN_MENU_LABELS['status']:
+            await m.answer(_status_text(st, heartbeat, scan_lock.locked()), reply_markup=_menu_kb(scan_lock.locked()))
+        elif text == _MAIN_MENU_LABELS['help']:
+            await m.answer(_help_text(), reply_markup=_menu_kb(scan_lock.locked()))
+        elif text == _MAIN_MENU_LABELS['stop']:
+            if scan_lock.locked():
+                cancel_event.set()
+                heartbeat.beat(status='scan_stop_requested', user_id=m.from_user.id)
+                await m.answer('⛔ Останавливаю текущую задачу…', reply_markup=_menu_kb(True))
+            else:
+                await m.answer('Сейчас ничего не выполняется.', reply_markup=_menu_kb(False))
+        elif text == _MAIN_MENU_LABELS['scan_all']:
+            if scan_lock.locked():
+                await m.answer('Скан уже идёт. Нажми ⛔ Стоп, если нужно остановить.', reply_markup=_menu_kb(True))
+                return
+            opts = ScanOptions(mode=st.mode, chat_ids=None, order=st.order)
+            await start_scan_task(m, m.from_user.id, st, opts, '🔎 Поиск во всех')
+        elif text == _MAIN_MENU_LABELS['pick']:
+            if not st.dialogs_cache:
+                await m.answer('Гружу список чатов…', reply_markup=_menu_kb(scan_lock.locked()))
+                st.dialogs_cache = await scanner.list_dialogs()
+                st.dialogs_cache.sort(key=lambda x: (x.get('name') or '').lower())
+            st.page = 0
+            await m.answer(_pick_text(st.dialogs_cache, st.selected_chats, st.page), reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page))
+        elif text == _MAIN_MENU_LABELS['mode']:
+            await m.answer('⏱ <b>Период сканирования</b>\nВыбери, какие сообщения проверять:', reply_markup=_mode_kb(st.mode))
+        elif text == _MAIN_MENU_LABELS['order']:
+            await m.answer('🔁 <b>Порядок сканирования</b>\nС какой стороны читать историю:', reply_markup=_order_kb(st.order))
+        elif text == _MAIN_MENU_LABELS['reports']:
+            await m.answer(_reports_menu_text(), reply_markup=_reports_menu_kb())
+        elif text == _MAIN_MENU_LABELS['empty']:
+            msg = await m.answer('Открываю список пустых…', reply_markup=_menu_kb(scan_lock.locked()))
+            await render_empty_list(msg, st)
+        elif text == _MAIN_MENU_LABELS['excluded']:
+            msg = await m.answer('Открываю исключения…', reply_markup=_menu_kb(scan_lock.locked()))
+            await render_excluded(msg, st, st.excluded_page)
 
     @dp.message(F.text)
     async def video_link_message(m: Message):
@@ -704,7 +940,7 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         heartbeat.beat(status='back_main', user_id=c.from_user.id)
-        await safe_edit_text(c.message, _main_text(st, scan_lock.locked()), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+        await safe_edit_text(c.message, _main_text(st, scan_lock.locked()), reply_markup=_menu_kb(is_scanning=scan_lock.locked()))
         await c.answer()
 
     @dp.callback_query(F.data == 'mode:open')
@@ -851,7 +1087,7 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         await c.answer()
-        await safe_edit_text(c.message, _status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
+        await safe_edit_text(c.message, _status_text(st, heartbeat, scan_lock.locked()), reply_markup=_menu_kb(scan_lock.locked()))
 
     @dp.callback_query(F.data == 'reports:menu')
     async def reports_menu(c: CallbackQuery):
@@ -1013,7 +1249,7 @@ async def run_control_bot(
             if st.last_stats['empty_chats']:
                 await render_empty_list(c.message, st)
             else:
-                await safe_edit_text(c.message, f'✅ {escape(info)}', reply_markup=_main_kb(scan_lock.locked()))
+                await safe_edit_text(c.message, f'✅ {escape(info)}', reply_markup=_menu_kb(scan_lock.locked()))
         else:
             await c.message.answer(f'Не удалось удалить: {escape(info)}')
         await c.answer('Готово' if ok else 'Ошибка')
@@ -1073,7 +1309,7 @@ async def run_control_bot(
         await safe_edit_text(
             progress_msg,
             f'✅ Массовое удаление/выход завершено.\nУдалено: <b>{deleted}</b>\nОсталось в списке: <b>{len(remaining)}</b>{fail_text}',
-            reply_markup=_main_kb(scan_lock.locked()),
+            reply_markup=_menu_kb(scan_lock.locked()),
         )
 
     @dp.callback_query(F.data == 'excluded:list')
@@ -1139,161 +1375,7 @@ async def run_control_bot(
             await c.answer('Неизвестная команда', show_alert=True)
             return
 
-        cancel_event.clear()
         await c.answer('Запускаю…')
-
-        progress_msg = await c.message.answer(
-            f'{title}\nПериод: <b>{escape(_mode_label(st.mode))}</b>\nПорядок: <b>{escape(_order_label(st.order))}</b>\nСтатус: старт…',
-            disable_web_page_preview=True,
-        )
-
-        last_edit = 0.0
-        state = {
-            'dialogs_total': 0,
-            'chat_index': 0,
-            'checked': 0,
-            'matched': 0,
-            'forwarded': 0,
-            'floodwait': None,
-            'chat_name': '—',
-            'stage': 'старт',
-            'msg_id': None,
-        }
-
-        async def progress_cb(ev: dict[str, Any]):
-            nonlocal last_edit
-            now = time.time()
-            event_type = ev.get('type')
-
-            stage_labels = {
-                'init': 'готовлю список чатов',
-                'chat_start': 'проверяю чат',
-                'tick': 'читаю сообщения',
-                'download_start': 'скачиваю видео на сервер',
-                'download_progress': 'скачиваю видео на сервер',
-                'download_done': 'скачано, готовлю обложку',
-                'thumbnail_start': 'генерирую обложку',
-                'thumbnail_done': 'обложка готова' if ev.get('thumb_path') else 'обложку создать не удалось',
-                'upload_start': f'загружаю в @{scanner.target_bot_username}',
-                'upload_progress': f'загружаю в @{scanner.target_bot_username}',
-                'upload_done': 'загрузка завершена',
-                'local_delete': 'локальный файл удалён',
-                'forward': 'видео учтено как загруженное',
-                'chat_done': 'чат завершён',
-                'done': 'сканирование завершено',
-                'error': 'ошибка в чате',
-                'floodwait': f'FloodWait {ev.get("seconds", 0)} сек',
-            }
-            state['stage'] = stage_labels.get(event_type, str(event_type or state['stage']))
-            if ev.get('msg_id'):
-                state['msg_id'] = ev.get('msg_id')
-
-            if event_type == 'init':
-                state['dialogs_total'] = ev.get('dialogs_total', 0)
-            elif event_type == 'chat_start':
-                state['chat_index'] = ev.get('chat_index', 0)
-                state['chat_name'] = ev.get('chat_name', '—')
-                state['msg_id'] = None
-            elif event_type in {'tick', 'forward', 'chat_done', 'done'}:
-                state['checked'] = ev.get('checked', state['checked'])
-                state['matched'] = ev.get('matched', state['matched'])
-                state['forwarded'] = ev.get('forwarded', state['forwarded'])
-                if ev.get('chat_name'):
-                    state['chat_name'] = ev['chat_name']
-            elif event_type == 'floodwait':
-                state['floodwait'] = ev.get('seconds')
-
-            if ev.get('chat_name'):
-                state['chat_name'] = ev['chat_name']
-            if event_type in {'download_progress', 'upload_progress'}:
-                state['percent'] = ev.get('percent')
-                state['current_human'] = ev.get('current_human')
-                state['total_human'] = ev.get('total_human')
-            elif event_type in {'download_start', 'download_done', 'thumbnail_start', 'thumbnail_done', 'upload_start', 'upload_done', 'local_delete', 'forward', 'chat_done'}:
-                state.pop('percent', None)
-                state.pop('current_human', None)
-                state.pop('total_human', None)
-
-            heartbeat.beat(
-                status='scan_progress',
-                event_type=event_type,
-                chat_index=state['chat_index'],
-                dialogs_total=state['dialogs_total'],
-                checked=state['checked'],
-                matched=state['matched'],
-                forwarded=state['forwarded'],
-            )
-
-            if now - last_edit < progress_edit_interval_sec and event_type not in {'done', 'floodwait', 'download_done', 'thumbnail_done', 'upload_done', 'local_delete'}:
-                return
-            last_edit = now
-
-            fw_line = f'\n⏳ FloodWait: <b>{state["floodwait"]} сек</b>' if state['floodwait'] else ''
-            msg_line = f'\nСообщение: <b>#{state["msg_id"]}</b>' if state.get('msg_id') else ''
-            text = (
-                f'{title}\n'
-                f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
-                f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
-                f'Чаты: <b>{state["chat_index"]} / {state["dialogs_total"]}</b>\n'
-                f'Текущий: <b>{escape(str(state["chat_name"]))}</b>\n'
-                f'Проверено: <b>{state["checked"]}</b>\n'
-                f'Подошло: <b>{state["matched"]}</b>\n'
-                f'Загружено: <b>{state["forwarded"]}</b>\n'
-                f'Этап: <b>{escape(str(state["stage"]))}</b>'
-                f'{msg_line}'
-                f'{_transfer_line(state)}'
-                f'{fw_line}'
-            )
-            await safe_edit_text(progress_msg, text)
-
-        origin_message = c.message
-        user_id = c.from_user.id
-
-        await scan_lock.acquire()
-
-        async def run_scan_task() -> None:
-            try:
-                st.last_run_at = int(time.time())
-                heartbeat.beat(status='scan_locked', user_id=user_id)
-                stats = await scanner.scan(opts, cancel_event=cancel_event, progress_cb=progress_cb)
-            except asyncio.CancelledError:
-                heartbeat.beat(status='scan_task_cancelled', user_id=user_id)
-                raise
-            except Exception as e:
-                log.exception('scan task failed')
-                stats = {
-                    'dialogs': state['dialogs_total'],
-                    'checked': state['checked'],
-                    'video_found': 0,
-                    'matched': state['matched'],
-                    'forwarded': state['forwarded'],
-                    'skipped_already_forwarded': 0,
-                    'reject_reasons': {},
-                    'top_chats': [],
-                    'errors': 1,
-                    'empty_chats_count': 0,
-                    'empty_chats_updated': False,
-                    'cancelled': True,
-                    'elapsed_sec': int(time.time() - st.last_run_at) if st.last_run_at else 0,
-                }
-                heartbeat.beat(status='scan_failed', user_id=user_id, error=e.__class__.__name__)
-                try:
-                    await progress_msg.answer(f'❌ Скан упал с ошибкой: <code>{escape(e.__class__.__name__)}</code>')
-                except Exception:
-                    log.exception('failed to notify about scan failure')
-            finally:
-                if scan_lock.locked():
-                    scan_lock.release()
-
-            st.last_stats = stats
-            st.last_empty_page = 0
-            tail = '\n⛔ <b>Остановлено</b>' if stats.get('cancelled') else '\n✅ <b>Завершено</b>'
-            await safe_edit_text(progress_msg, _format_report(stats) + tail)
-            try:
-                await origin_message.answer(_main_text(st, False), reply_markup=_main_kb(is_scanning=False))
-            except Exception:
-                log.exception('failed to send menu after scan')
-
-        asyncio.create_task(run_scan_task(), name=f'video-collector-scan-{user_id}')
+        await start_scan_task(c.message, c.from_user.id, st, opts, title)
 
     await dp.start_polling(bot, polling_timeout=10, handle_as_tasks=True, close_bot_session=True)
