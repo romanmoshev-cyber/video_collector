@@ -61,6 +61,10 @@ class Config:
     database_path: Path
     logs_dir: Path
     heartbeat_path: Path
+    download_dir: Path
+    ytdlp_cookies_file: Path | None
+    max_upload_size_mb: int
+    min_free_disk_mb: int
     watchdog_timeout_sec: int
     watchdog_check_interval_sec: int
     progress_edit_interval_sec: float
@@ -90,6 +94,11 @@ def load_config() -> Config:
     database_path = Path(os.getenv('DATABASE_PATH', str(BASE_DIR / 'data' / 'bot.sqlite3'))).resolve()
     logs_dir = Path(os.getenv('LOGS_DIR', str(BASE_DIR / 'logs'))).resolve()
     heartbeat_path = Path(os.getenv('HEARTBEAT_PATH', str(BASE_DIR / 'runtime' / 'heartbeat.json'))).resolve()
+    download_dir = Path(os.getenv('DOWNLOAD_DIR', str(BASE_DIR / 'runtime' / 'downloads'))).resolve()
+    ytdlp_cookies_raw = os.getenv('YTDLP_COOKIES_FILE', '').strip()
+    ytdlp_cookies_file = Path(ytdlp_cookies_raw).resolve() if ytdlp_cookies_raw else None
+    max_upload_size_mb = _int('MAX_UPLOAD_SIZE_MB', 1900)
+    min_free_disk_mb = _int('MIN_FREE_DISK_MB', 2048)
 
     watchdog_timeout_sec = _int('WATCHDOG_TIMEOUT_SEC', 900)
     watchdog_check_interval_sec = _int('WATCHDOG_CHECK_INTERVAL_SEC', 15)
@@ -110,6 +119,8 @@ def load_config() -> Config:
         raise ValueError('API_ID/API_HASH are empty')
     if not phone:
         raise ValueError('PHONE is empty (needed for first MTProto login)')
+    if ytdlp_cookies_file and not ytdlp_cookies_file.exists():
+        raise ValueError(f'YTDLP_COOKIES_FILE does not exist: {ytdlp_cookies_file}')
 
     return Config(
         bot_token=bot_token,
@@ -125,6 +136,10 @@ def load_config() -> Config:
         database_path=database_path,
         logs_dir=logs_dir,
         heartbeat_path=heartbeat_path,
+        download_dir=download_dir,
+        ytdlp_cookies_file=ytdlp_cookies_file,
+        max_upload_size_mb=max_upload_size_mb,
+        min_free_disk_mb=min_free_disk_mb,
         watchdog_timeout_sec=watchdog_timeout_sec,
         watchdog_check_interval_sec=watchdog_check_interval_sec,
         progress_edit_interval_sec=progress_edit_interval_sec,

@@ -107,6 +107,10 @@ async def async_main() -> None:
             dialog_delay_sec=cfg.dialog_delay_sec,
             max_flood_wait_sec=cfg.max_flood_wait_sec,
             dry_run_delete=cfg.dry_run_delete,
+            download_dir=cfg.download_dir,
+            ytdlp_cookies_file=cfg.ytdlp_cookies_file,
+            max_upload_size_mb=cfg.max_upload_size_mb,
+            min_free_disk_mb=cfg.min_free_disk_mb,
         )
 
         hb_task = asyncio.create_task(heartbeat_loop(heartbeat, interval_sec=10))
