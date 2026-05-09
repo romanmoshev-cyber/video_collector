@@ -483,7 +483,7 @@ class Scanner:
 
         def run_download() -> dict[str, Any]:
             if importlib.util.find_spec('yt_dlp') is None:
-                raise RuntimeError('Не установлен пакет yt-dlp. Запусти: python3 -m pip install -r requirements.txt')
+                raise RuntimeError('Не установлен пакет yt-dlp в текущем Python. Перезапусти сервис через ./run.sh или установи зависимости: ./venv/bin/python -m pip install -r requirements.txt')
             import yt_dlp
 
             if not shutil.which('ffmpeg'):
