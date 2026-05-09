@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import importlib.util
 import logging
 import random
 import re
 import shutil
+import subprocess
+import sys
 import time
 from urllib.parse import urlparse
 from dataclasses import dataclass
@@ -113,6 +116,31 @@ TELEGRAM_LINK_RE = re.compile(r'https?://(?:www\.)?t(?:elegram)?\.me/(?P<path>[^
 
 def _clean_url(url: str) -> str:
     return url.strip().rstrip(').,;')
+
+
+def _ensure_ytdlp_available() -> None:
+    if importlib.util.find_spec('yt_dlp') is not None:
+        return
+
+    app_dir = Path(__file__).resolve().parent
+    requirements_file = app_dir / 'requirements.txt'
+    install_target = ['-r', str(requirements_file)] if requirements_file.exists() else ['yt-dlp']
+    command = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *install_target]
+    log.warning('yt-dlp is missing in current Python; installing dependencies with: %s', ' '.join(command))
+    result = subprocess.run(command, cwd=app_dir, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or '').strip()
+        raise RuntimeError(
+            'Не установлен пакет yt-dlp в текущем Python, и автоматическая установка не удалась. '
+            f'Команда: {" ".join(command)}. '
+            f'Вывод: {details[-1200:]}'
+        )
+    importlib.invalidate_caches()
+    if importlib.util.find_spec('yt_dlp') is None:
+        raise RuntimeError(
+            'yt-dlp был установлен pip без ошибки, но всё ещё не виден текущему Python. '
+            f'Перезапусти сервис через ./run.sh или выполни: {" ".join(command)}'
+        )
 
 
 def _source_name_from_url(url: str) -> str:
@@ -482,15 +510,19 @@ class Scanner:
         self.heartbeat.beat(status='download_start', source_id=url, source_name=source_name)
 
         def run_download() -> dict[str, Any]:
-            if importlib.util.find_spec('yt_dlp') is None:
-                raise RuntimeError('Не установлен пакет yt-dlp в текущем Python. Перезапусти сервис через ./run.sh или установи зависимости: ./venv/bin/python -m pip install -r requirements.txt')
-            import yt_dlp
+            _ensure_ytdlp_available()
+            yt_dlp = importlib.import_module('yt_dlp')
 
-            if not shutil.which('ffmpeg'):
-                raise RuntimeError('Для скачивания лучшего качества нужен ffmpeg: yt-dlp часто скачивает видео и звук отдельно')
+            ffmpeg_path = shutil.which('ffmpeg')
+            if ffmpeg_path:
+                selected_format = 'bestvideo*+bestaudio/best'
+                log.debug('ffmpeg found at %s; using best merged yt-dlp format', ffmpeg_path)
+            else:
+                selected_format = 'best[ext=mp4]/best'
+                log.warning('ffmpeg is not installed; using best single-file yt-dlp format without merge')
+
             options = {
-                'format': 'bestvideo*+bestaudio/best',
-                'merge_output_format': 'mp4',
+                'format': selected_format,
                 'outtmpl': str(work_dir / '%(extractor)s_%(id)s.%(ext)s'),
                 'noplaylist': True,
                 'playlist_items': '1',
@@ -503,6 +535,8 @@ class Scanner:
                 'fragment_retries': 3,
                 'socket_timeout': 30,
             }
+            if ffmpeg_path:
+                options['merge_output_format'] = 'mp4'
             if self.ytdlp_cookies_file:
                 options['cookiefile'] = str(self.ytdlp_cookies_file)
             with yt_dlp.YoutubeDL(options) as ydl:
