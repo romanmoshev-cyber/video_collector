@@ -124,6 +124,47 @@ def _find_ffmpeg() -> str | None:
     return str(bundled_ffmpeg) if bundled_ffmpeg else None
 
 
+def _generate_video_thumbnail(video_path: Path, work_dir: Path, source_id: str, duration: Any = None) -> Path | None:
+    ffmpeg_path = _find_ffmpeg()
+    if not ffmpeg_path:
+        log.debug('Cannot generate video thumbnail without ffmpeg')
+        return None
+
+    try:
+        duration_sec = float(duration or 0)
+    except (TypeError, ValueError):
+        duration_sec = 0
+    seek_sec = max(0.0, min(3.0, duration_sec / 3.0)) if duration_sec else 1.0
+
+    thumb_path = work_dir / f'{source_id}_thumb.jpg'
+    for quality in (5, 8, 12, 16, 20):
+        cmd = [
+            ffmpeg_path,
+            '-y',
+            '-ss',
+            f'{seek_sec:.3f}',
+            '-i',
+            str(video_path),
+            '-frames:v',
+            '1',
+            '-vf',
+            'scale=320:320:force_original_aspect_ratio=decrease',
+            '-q:v',
+            str(quality),
+            str(thumb_path),
+        ]
+        completed = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if completed.returncode != 0 or not thumb_path.exists() or thumb_path.stat().st_size <= 0:
+            continue
+        if thumb_path.stat().st_size <= 20 * 1024:
+            return thumb_path
+
+    if thumb_path.exists() and thumb_path.stat().st_size > 0:
+        log.debug('Generated thumbnail is larger than Telegram recommendation: %s bytes', thumb_path.stat().st_size)
+        return thumb_path
+    return None
+
+
 def _sent_message_id(sent: Any) -> int | None:
     if isinstance(sent, list):
         sent = sent[0] if sent else None
@@ -438,12 +479,20 @@ class Scanner:
             self.heartbeat.beat(status='upload_start', chat_id=chat_id, msg_id=msg.id)
             meta = _extract_video_meta(msg)
             attributes = _video_attributes_from_values(meta[0], meta[1], meta[2]) if meta else None
+            thumb = await asyncio.to_thread(
+                _generate_video_thumbnail,
+                downloaded_path,
+                work_dir,
+                f'{abs(chat_id)}_{msg.id}',
+                meta[2] if meta else None,
+            )
             sent = await self.client.send_file(
                 target,
                 downloaded_path,
                 force_document=False,
                 supports_streaming=True,
                 attributes=attributes,
+                thumb=thumb,
             )
             sent_msg_id = _sent_message_id(sent)
             if not sent_msg_id:
@@ -492,6 +541,7 @@ class Scanner:
         source_id: str,
         source_name: str,
         attributes: list[DocumentAttributeVideo] | None = None,
+        thumb: Path | None = None,
         progress_cb: Optional[ProgressCB] = None,
     ) -> int:
         self._ensure_upload_size_allowed(file_path)
@@ -504,6 +554,7 @@ class Scanner:
             force_document=False,
             supports_streaming=True,
             attributes=attributes,
+            thumb=thumb,
         )
         sent_msg_id = _sent_message_id(sent)
         if not sent_msg_id:
@@ -528,6 +579,7 @@ class Scanner:
         source_id: str,
         source_name: str,
         attributes: list[DocumentAttributeVideo] | None = None,
+        thumb: Path | None = None,
         progress_cb: Optional[ProgressCB] = None,
     ) -> int:
         try:
@@ -538,6 +590,7 @@ class Scanner:
                     source_id=source_id,
                     source_name=source_name,
                     attributes=attributes,
+                    thumb=thumb,
                     progress_cb=progress_cb,
                 )
             except FloodWaitError as e:
@@ -553,6 +606,7 @@ class Scanner:
                     source_id=source_id,
                     source_name=source_name,
                     attributes=attributes,
+                    thumb=thumb,
                     progress_cb=progress_cb,
                 )
             except Exception as e:
@@ -567,6 +621,7 @@ class Scanner:
                     source_id=source_id,
                     source_name=source_name,
                     attributes=attributes,
+                    thumb=thumb,
                     progress_cb=progress_cb,
                 )
         finally:
@@ -659,6 +714,14 @@ class Scanner:
             )
             downloaded_size = downloaded_path.stat().st_size
             attributes = _video_attributes_from_info(info)
+            duration = info.get('duration')
+            thumb = await asyncio.to_thread(
+                _generate_video_thumbnail,
+                downloaded_path,
+                work_dir,
+                source_id,
+                duration,
+            )
             target_msg_id = await self._send_local_file_delete_with_retry(
                 target,
                 downloaded_path,
@@ -666,6 +729,7 @@ class Scanner:
                 source_id=source_id,
                 source_name=source_name,
                 attributes=attributes,
+                thumb=thumb,
                 progress_cb=progress_cb,
             )
             return {

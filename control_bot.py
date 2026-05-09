@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from html import escape
 from typing import Any, Optional
@@ -35,6 +36,11 @@ class UserState:
     report_period: str = 'all'
     report_page: int = 0
     excluded_page: int = 0
+
+
+@dataclass
+class LinkQueueEntry:
+    link: str
 
 
 def _is_allowed(user_id: int, allowed: set[int]) -> bool:
@@ -116,7 +122,8 @@ def _help_text() -> str:
         '/status — показать состояние процесса и heartbeat.\n'
         '/help — краткая справка.\n\n'
         'Можно просто прислать одну или несколько ссылок на страницы с видео — бот сам найдёт видео, выберет лучшее качество, поставит в очередь, '
-        'скачает на сервер, отправит в @Content_Vertical_BOT и удалит локальный файл.\n\n'
+        'скачает на сервер, отправит в @Content_Vertical_BOT и удалит локальный файл. Если прислать ссылки во время загрузки, '
+        'они добавятся в конец текущей очереди.\n\n'
         'Для сканирования: выбери период, выбери чаты или запусти поиск по всем, затем смотри отчёт. '
         'Для безопасной проверки удаления пустых чатов включи <code>DRY_RUN_DELETE=true</code>.'
     )
@@ -461,17 +468,53 @@ async def run_control_bot(
         except Exception:
             log.exception('safe_edit_text failed')
 
+    link_queue: deque[LinkQueueEntry] = deque()
+    link_queue_accepting = False
+    link_queue_total = 0
+    link_queue_processed = 0
+
     async def process_link_batch(message: Message, links: list[str]) -> None:
+        nonlocal link_queue_accepting, link_queue_total, link_queue_processed
+
+        active_link_queue = link_queue_accepting
+        if active_link_queue:
+            start_pos = link_queue_total + 1
+            link_queue.extend(LinkQueueEntry(link=link) for link in links)
+            link_queue_total += len(links)
+            pending = link_queue_total - link_queue_processed
+            heartbeat.beat(
+                status='link_queue_add',
+                user_id=message.from_user.id,
+                links_added=len(links),
+                links_total=link_queue_total,
+                links_pending=pending,
+            )
+            await message.answer(
+                '➕ <b>Добавлено в очередь</b>\n'
+                f'Добавлено ссылок: <b>{len(links)}</b>\n'
+                f'Позиции: <b>{start_pos}–{link_queue_total}</b>\n'
+                f'Осталось в очереди: <b>{pending}</b>',
+                disable_web_page_preview=True,
+                reply_markup=_main_kb(True),
+            )
+            return
+
         if scan_lock.locked():
-            await message.answer('Сейчас уже идёт задача. Дождись окончания или нажми ⛔ Стоп для сканирования.', reply_markup=_main_kb(True))
+            await message.answer('Сейчас идёт сканирование. Дождись окончания или нажми ⛔ Стоп.', reply_markup=_main_kb(True))
             return
 
         cancel_event.clear()
+        link_queue.clear()
+        link_queue.extend(LinkQueueEntry(link=link) for link in links)
+        link_queue_total = len(links)
+        link_queue_processed = 0
+        link_queue_accepting = True
+
         progress_msg = await message.answer(
             f'🔗 <b>Очередь ссылок</b>\nНайдено ссылок: <b>{len(links)}</b>\nСтатус: старт…',
             disable_web_page_preview=True,
         )
-        state = {'idx': 0, 'total': len(links), 'stage': 'старт', 'chat_name': '—'}
+        state = {'idx': 0, 'total': link_queue_total, 'stage': 'старт', 'chat_name': '—'}
         last_edit = 0.0
 
         async def link_progress_cb(ev: dict[str, Any]) -> None:
@@ -486,6 +529,7 @@ async def run_control_bot(
                 'local_delete': 'локальный файл удалён',
                 'floodwait': f'FloodWait {ev.get("seconds", 0)} сек',
             }
+            state['total'] = link_queue_total
             state['stage'] = labels.get(event_type, str(event_type or state['stage']))
             if ev.get('chat_name'):
                 state['chat_name'] = ev['chat_name']
@@ -504,6 +548,7 @@ async def run_control_bot(
                 progress_msg,
                 '🔗 <b>Очередь ссылок</b>\n'
                 f'Видео: <b>{state["idx"]} / {state["total"]}</b>\n'
+                f'В ожидании: <b>{len(link_queue)}</b>\n'
                 f'Источник: <b>{escape(str(state["chat_name"]))}</b>\n'
                 f'Статус: <b>{escape(str(state["stage"]))}</b>',
             )
@@ -511,55 +556,64 @@ async def run_control_bot(
         await scan_lock.acquire()
 
         async def run_link_task() -> None:
+            nonlocal link_queue_accepting, link_queue_processed
             results: list[dict[str, Any]] = []
             errors: list[str] = []
             try:
-                heartbeat.beat(status='link_queue_start', user_id=message.from_user.id, links_total=len(links))
-                for idx, link in enumerate(links, start=1):
+                heartbeat.beat(status='link_queue_start', user_id=message.from_user.id, links_total=link_queue_total)
+                while link_queue:
+                    entry = link_queue.popleft()
+                    link_queue_processed += 1
+                    idx = link_queue_processed
                     state['idx'] = idx
+                    state['total'] = link_queue_total
                     state['stage'] = 'обрабатываю ссылку'
                     state['chat_name'] = '—'
                     await safe_edit_text(
                         progress_msg,
                         '🔗 <b>Очередь ссылок</b>\n'
-                        f'Видео: <b>{idx} / {len(links)}</b>\n'
+                        f'Видео: <b>{idx} / {link_queue_total}</b>\n'
+                        f'В ожидании: <b>{len(link_queue)}</b>\n'
                         f'Статус: <b>обрабатываю ссылку</b>\n'
-                        f'Ссылка: <code>{escape(link)}</code>',
+                        f'Ссылка: <code>{escape(entry.link)}</code>',
                     )
                     try:
-                        result = await scanner.process_video_link(link, progress_cb=link_progress_cb)
+                        result = await scanner.process_video_link(entry.link, progress_cb=link_progress_cb)
                         results.append(result)
                     except Exception as e:
                         log.exception('failed to process video link')
-                        errors.append(f'{link} — {e.__class__.__name__}: {e}')
+                        errors.append(f'{entry.link} — {e.__class__.__name__}: {e}')
+                link_queue_accepting = False
                 heartbeat.beat(status='link_queue_done', user_id=message.from_user.id, ok=len(results), errors=len(errors))
+
+                lines = [
+                    '🔗 <b>Очередь ссылок завершена</b>',
+                    f'Всего ссылок: <b>{link_queue_total}</b>',
+                    f'Успешно загружено: <b>{len(results)}</b>',
+                    f'Ошибок: <b>{len(errors)}</b>',
+                ]
+                if results:
+                    lines.append('')
+                    lines.append('✅ <b>Готово</b>')
+                    for item in results[:10]:
+                        source = escape(str(item.get('chat_name') or item.get('chat_id') or 'ссылка'))
+                        title = item.get('title')
+                        title_part = f' · {escape(_short_title(str(title), 40))}' if title else ''
+                        message_part = f' #{item["message_id"]}' if item.get('message_id') else ''
+                        target_part = f' → @{scanner.target_bot_username} #{item["target_message_id"]}' if item.get('target_message_id') else ''
+                        lines.append(
+                            f'  • {source}{message_part}{title_part}{target_part} · {_format_duration(item.get("elapsed_sec", 0))}'
+                        )
+                if errors:
+                    lines.append('')
+                    lines.append('❌ <b>Ошибки</b>')
+                    for error in errors[:5]:
+                        lines.append(f'  • <code>{escape(error[:180])}</code>')
+                await safe_edit_text(progress_msg, '\n'.join(lines), reply_markup=_main_kb(False))
             finally:
+                link_queue_accepting = False
                 if scan_lock.locked():
                     scan_lock.release()
-
-            lines = [
-                '🔗 <b>Очередь ссылок завершена</b>',
-                f'Успешно загружено: <b>{len(results)}</b>',
-                f'Ошибок: <b>{len(errors)}</b>',
-            ]
-            if results:
-                lines.append('')
-                lines.append('✅ <b>Готово</b>')
-                for item in results[:10]:
-                    source = escape(str(item.get('chat_name') or item.get('chat_id') or 'ссылка'))
-                    title = item.get('title')
-                    title_part = f' · {escape(_short_title(str(title), 40))}' if title else ''
-                    message_part = f' #{item["message_id"]}' if item.get('message_id') else ''
-                    target_part = f' → @{scanner.target_bot_username} #{item["target_message_id"]}' if item.get('target_message_id') else ''
-                    lines.append(
-                        f'  • {source}{message_part}{title_part}{target_part} · {_format_duration(item.get("elapsed_sec", 0))}'
-                    )
-            if errors:
-                lines.append('')
-                lines.append('❌ <b>Ошибки</b>')
-                for error in errors[:5]:
-                    lines.append(f'  • <code>{escape(error[:180])}</code>')
-            await safe_edit_text(progress_msg, '\n'.join(lines), reply_markup=_main_kb(False))
 
         asyncio.create_task(run_link_task(), name=f'video-link-queue-{message.from_user.id}')
 
