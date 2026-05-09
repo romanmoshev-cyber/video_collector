@@ -27,6 +27,7 @@ from watchdog import Heartbeat
 log = logging.getLogger('scanner')
 MB = 1024 * 1024
 MAX_TELEGRAM_THUMB_SIZE = 200 * 1024
+STALE_DOWNLOAD_DIR_AGE_SEC = 6 * 60 * 60
 ProgressCB = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -499,12 +500,37 @@ class Scanner:
                 raise
             return await func()
 
+    def _cleanup_stale_downloads(self) -> int:
+        if not self.download_dir.exists():
+            return 0
+        now = time.time()
+        removed = 0
+        for path in self.download_dir.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < STALE_DOWNLOAD_DIR_AGE_SEC:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+        if removed:
+            log.info('Removed %s stale download work dirs from %s', removed, self.download_dir)
+        return removed
+
     def _ensure_download_dir_ready(self) -> None:
         self.download_dir.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(self.download_dir).free
         if free < self.min_free_disk:
+            self._cleanup_stale_downloads()
+            free = shutil.disk_usage(self.download_dir).free
+        if free < self.min_free_disk:
             raise RuntimeError(
-                f'Недостаточно свободного места в DOWNLOAD_DIR: {free // MB} МБ, нужно минимум {self.min_free_disk // MB} МБ'
+                f'Недостаточно свободного места в DOWNLOAD_DIR: {_format_bytes(free)}, '
+                f'нужно минимум {_format_bytes(self.min_free_disk)}. '
+                'Освободите место или уменьшите MIN_FREE_DISK_MB в .env.'
             )
 
     def _ensure_upload_size_allowed(self, file_path: Path) -> int:
