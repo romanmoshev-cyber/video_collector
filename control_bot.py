@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from html import escape
@@ -18,6 +19,7 @@ from scanner import ScanOptions, Scanner
 from watchdog import Heartbeat
 
 log = logging.getLogger('control_bot')
+URL_RE = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
 
 
 @dataclass
@@ -113,7 +115,9 @@ def _help_text() -> str:
         '/start — открыть главное меню.\n'
         '/status — показать состояние процесса и heartbeat.\n'
         '/help — краткая справка.\n\n'
-        'Главный сценарий: выбери период, выбери чаты или запусти поиск по всем, затем смотри отчёт. '
+        'Можно просто прислать одну или несколько ссылок на страницы с видео — бот сам найдёт видео, выберет лучшее качество, поставит в очередь, '
+        'скачает на сервер, отправит в @Content_Vertical_BOT и удалит локальный файл.\n\n'
+        'Для сканирования: выбери период, выбери чаты или запусти поиск по всем, затем смотри отчёт. '
         'Для безопасной проверки удаления пустых чатов включи <code>DRY_RUN_DELETE=true</code>.'
     )
 
@@ -198,7 +202,7 @@ def _empty_item_text(item: dict[str, Any], page: int, total: int) -> str:
         f'<b>Проверено сообщений:</b> {item.get("checked", 0)}\n'
         f'<b>Подошло:</b> {item.get("matched", 0)}\n'
         f'<b>Видео найдено:</b> {item.get("video_found", 0)}\n'
-        f'<b>Форварднуто:</b> {item.get("forwarded", 0)}\n'
+        f'<b>Загружено:</b> {item.get("forwarded", 0)}\n'
         f'{link_line}'
     )
 
@@ -282,7 +286,7 @@ def _format_report(stats: Optional[dict[str, Any]]) -> str:
         name = _short_title(str(item.get('name') or item.get('id') or '—'), limit=24)
         top_lines.append(
             f'  • {escape(name)}: подошло <b>{item.get("matched", 0)}</b>, '
-            f'форвард <b>{item.get("forwarded", 0)}</b>'
+            f'загружено <b>{item.get("forwarded", 0)}</b>'
         )
 
     lines = [
@@ -291,7 +295,7 @@ def _format_report(stats: Optional[dict[str, Any]]) -> str:
         f'Проверено сообщений: <b>{stats.get("checked", 0)}</b>',
         f'Видео найдено: <b>{stats.get("video_found", stats.get("matched", 0))}</b>',
         f'Подошло видео: <b>{stats.get("matched", 0)}</b>',
-        f'Форварднуто: <b>{stats.get("forwarded", 0)}</b>',
+        f'Загружено: <b>{stats.get("forwarded", 0)}</b>',
         f'Пропущено как дубль: <b>{stats.get("skipped_already_forwarded", 0)}</b>',
         f'Ошибок: <b>{stats.get("errors", 0)}</b>',
         f'Пустых каналов/групп: <b>{stats.get("empty_chats_count", 0)}</b>',
@@ -356,7 +360,7 @@ def _report_rows_text(period: str, rows: list[dict[str, Any]], page: int) -> str
         lines.append(
             f'{num}. {title}\n'
             f'   видео: <b>{item.get("video_found", 0)}</b> · подошло: <b>{item.get("matched", 0)}</b> · '
-            f'форвард: <b>{item.get("forwarded", 0)}</b> · сообщений: <b>{item.get("checked", 0)}</b>'
+            f'загружено: <b>{item.get("forwarded", 0)}</b> · сообщений: <b>{item.get("checked", 0)}</b>'
         )
     return '\n'.join(lines)
 
@@ -457,6 +461,107 @@ async def run_control_bot(
         except Exception:
             log.exception('safe_edit_text failed')
 
+    async def process_link_batch(message: Message, links: list[str]) -> None:
+        if scan_lock.locked():
+            await message.answer('Сейчас уже идёт задача. Дождись окончания или нажми ⛔ Стоп для сканирования.', reply_markup=_main_kb(True))
+            return
+
+        cancel_event.clear()
+        progress_msg = await message.answer(
+            f'🔗 <b>Очередь ссылок</b>\nНайдено ссылок: <b>{len(links)}</b>\nСтатус: старт…',
+            disable_web_page_preview=True,
+        )
+        state = {'idx': 0, 'total': len(links), 'stage': 'старт', 'chat_name': '—'}
+        last_edit = 0.0
+
+        async def link_progress_cb(ev: dict[str, Any]) -> None:
+            nonlocal last_edit
+            now = time.time()
+            event_type = ev.get('type')
+            labels = {
+                'download_start': 'ищу видео на странице и скачиваю лучшее качество',
+                'download_done': 'скачано, начинаю загрузку',
+                'upload_start': 'загружаю в @Content_Vertical_BOT',
+                'upload_done': 'загрузка завершена',
+                'local_delete': 'локальный файл удалён',
+                'floodwait': f'FloodWait {ev.get("seconds", 0)} сек',
+            }
+            state['stage'] = labels.get(event_type, str(event_type or state['stage']))
+            if ev.get('chat_name'):
+                state['chat_name'] = ev['chat_name']
+
+            heartbeat.beat(
+                status='link_progress',
+                event_type=event_type,
+                link_index=state['idx'],
+                links_total=state['total'],
+            )
+
+            if now - last_edit < progress_edit_interval_sec and event_type not in {'floodwait', 'local_delete'}:
+                return
+            last_edit = now
+            await safe_edit_text(
+                progress_msg,
+                '🔗 <b>Очередь ссылок</b>\n'
+                f'Видео: <b>{state["idx"]} / {state["total"]}</b>\n'
+                f'Источник: <b>{escape(str(state["chat_name"]))}</b>\n'
+                f'Статус: <b>{escape(str(state["stage"]))}</b>',
+            )
+
+        await scan_lock.acquire()
+
+        async def run_link_task() -> None:
+            results: list[dict[str, Any]] = []
+            errors: list[str] = []
+            try:
+                heartbeat.beat(status='link_queue_start', user_id=message.from_user.id, links_total=len(links))
+                for idx, link in enumerate(links, start=1):
+                    state['idx'] = idx
+                    state['stage'] = 'обрабатываю ссылку'
+                    state['chat_name'] = '—'
+                    await safe_edit_text(
+                        progress_msg,
+                        '🔗 <b>Очередь ссылок</b>\n'
+                        f'Видео: <b>{idx} / {len(links)}</b>\n'
+                        f'Статус: <b>обрабатываю ссылку</b>\n'
+                        f'Ссылка: <code>{escape(link)}</code>',
+                    )
+                    try:
+                        result = await scanner.process_video_link(link, progress_cb=link_progress_cb)
+                        results.append(result)
+                    except Exception as e:
+                        log.exception('failed to process video link')
+                        errors.append(f'{link} — {e.__class__.__name__}: {e}')
+                heartbeat.beat(status='link_queue_done', user_id=message.from_user.id, ok=len(results), errors=len(errors))
+            finally:
+                if scan_lock.locked():
+                    scan_lock.release()
+
+            lines = [
+                '🔗 <b>Очередь ссылок завершена</b>',
+                f'Успешно загружено: <b>{len(results)}</b>',
+                f'Ошибок: <b>{len(errors)}</b>',
+            ]
+            if results:
+                lines.append('')
+                lines.append('✅ <b>Готово</b>')
+                for item in results[:10]:
+                    source = escape(str(item.get('chat_name') or item.get('chat_id') or 'ссылка'))
+                    title = item.get('title')
+                    title_part = f' · {escape(_short_title(str(title), 40))}' if title else ''
+                    message_part = f' #{item["message_id"]}' if item.get('message_id') else ''
+                    lines.append(
+                        f'  • {source}{message_part}{title_part} · {_format_duration(item.get("elapsed_sec", 0))}'
+                    )
+            if errors:
+                lines.append('')
+                lines.append('❌ <b>Ошибки</b>')
+                for error in errors[:5]:
+                    lines.append(f'  • <code>{escape(error[:180])}</code>')
+            await safe_edit_text(progress_msg, '\n'.join(lines), reply_markup=_main_kb(False))
+
+        asyncio.create_task(run_link_task(), name=f'video-link-queue-{message.from_user.id}')
+
     async def render_empty_list(message: Message, st: UserState):
         empty = await scanner.get_saved_empty_chats()
         if st.last_stats is None:
@@ -505,6 +610,15 @@ async def run_control_bot(
             return
         st = await get_state(m.from_user.id)
         await m.answer(_status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
+
+    @dp.message(F.text)
+    async def video_link_message(m: Message):
+        if not _is_allowed(m.from_user.id, allowed_users):
+            return
+        links = [link.rstrip(').,;') for link in URL_RE.findall(m.text or '')]
+        if not links:
+            return
+        await process_link_batch(m, links)
 
     @dp.callback_query(F.data == 'back:main')
     async def back_main(c: CallbackQuery):
@@ -1000,7 +1114,7 @@ async def run_control_bot(
                 f'Текущий: <b>{escape(str(state["chat_name"]))}</b>\n'
                 f'Проверено: <b>{state["checked"]}</b>\n'
                 f'Подошло: <b>{state["matched"]}</b>\n'
-                f'Форвард: <b>{state["forwarded"]}</b>'
+                f'Загружено: <b>{state["forwarded"]}</b>'
                 f'{fw_line}'
             )
             await safe_edit_text(progress_msg, text)

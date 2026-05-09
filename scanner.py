@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import random
+import re
+import shutil
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -12,6 +17,7 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.custom.dialog import Dialog
 from telethon.tl.types import DocumentAttributeVideo, Message
+import yt_dlp
 
 from db import DB
 from watchdog import Heartbeat
@@ -103,6 +109,17 @@ EMPTY_CHATS_KEY = 'empty_chats:last_full_scan'
 EXCLUDED_CHATS_KEY = 'excluded_chats:manual'
 CONNECTION_RECOVERY_ATTEMPTS = 3
 CONNECTION_RECOVERY_BASE_DELAY_SEC = 2.0
+TELEGRAM_LINK_RE = re.compile(r'https?://(?:www\.)?t(?:elegram)?\.me/(?P<path>[^?\s]+)', re.IGNORECASE)
+
+
+def _clean_url(url: str) -> str:
+    return url.strip().rstrip(').,;')
+
+
+def _source_name_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.netloc or 'external').removeprefix('www.')
+    return host or 'external'
 
 
 def _is_connection_error(error: BaseException) -> bool:
@@ -122,6 +139,10 @@ class Scanner:
         dialog_delay_sec: float,
         max_flood_wait_sec: int,
         dry_run_delete: bool,
+        download_dir: Path,
+        ytdlp_cookies_file: Path | None,
+        max_upload_size_mb: int,
+        min_free_disk_mb: int,
     ):
         self.client = client
         self.db = db
@@ -133,6 +154,10 @@ class Scanner:
         self.dialog_delay_sec = max(0.0, dialog_delay_sec)
         self.max_flood_wait_sec = max_flood_wait_sec
         self.dry_run_delete = dry_run_delete
+        self.download_dir = Path(download_dir)
+        self.ytdlp_cookies_file = Path(ytdlp_cookies_file) if ytdlp_cookies_file else None
+        self.max_upload_size = max(1, max_upload_size_mb) * MB
+        self.min_free_disk = max(0, min_free_disk_mb) * MB
         self._delete_lock = asyncio.Lock()
 
     async def _ensure_connected(self) -> None:
@@ -172,6 +197,22 @@ class Scanner:
             if not await self._recover_connection(context):
                 raise
             return await func()
+
+    def _ensure_download_dir_ready(self) -> None:
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(self.download_dir).free
+        if free < self.min_free_disk:
+            raise RuntimeError(
+                f'Недостаточно свободного места в DOWNLOAD_DIR: {free // MB} МБ, нужно минимум {self.min_free_disk // MB} МБ'
+            )
+
+    def _ensure_upload_size_allowed(self, file_path: Path) -> int:
+        size = file_path.stat().st_size
+        if size > self.max_upload_size:
+            raise RuntimeError(
+                f'Файл слишком большой для отправки: {size // MB} МБ, лимит MAX_UPLOAD_SIZE_MB={self.max_upload_size // MB}'
+            )
+        return size
 
     async def _collect_dialogs(self, opts: ScanOptions | None = None) -> list[Dialog]:
         for item in await self.db.kv_get_json(EXCLUDED_CHATS_KEY, []):
@@ -260,6 +301,295 @@ class Scanner:
 
     async def get_period_report(self, period: str) -> list[dict[str, Any]]:
         return await self.db.get_chat_stats(period)
+
+    async def _resolve_telegram_video_link(self, link: str) -> tuple[Any, Message]:
+        match = TELEGRAM_LINK_RE.search(_clean_url(link))
+        if not match:
+            raise ValueError('Поддерживаются ссылки вида https://t.me/channel/123 или https://t.me/c/123/456')
+
+        path_parts = [part for part in match.group('path').strip('/').split('/') if part]
+        if len(path_parts) >= 3 and path_parts[0] == 'c':
+            chat_id = int(f'-100{path_parts[1]}')
+            message_id = int(path_parts[2])
+            entity = await self.client.get_entity(chat_id)
+        elif len(path_parts) >= 2:
+            if path_parts[0] == 's' and len(path_parts) >= 3:
+                username = path_parts[1]
+                message_id = int(path_parts[2])
+            else:
+                username = path_parts[0]
+                message_id = int(path_parts[1])
+            entity = await self.client.get_entity(username)
+        else:
+            raise ValueError('Не смог разобрать ссылку на сообщение с видео')
+
+        msg = await self.client.get_messages(entity, ids=message_id)
+        if not msg:
+            raise ValueError('Сообщение по ссылке не найдено или аккаунту нет доступа')
+        if not _extract_video_meta(msg):
+            raise ValueError('По ссылке найдено сообщение без видео')
+        return entity, msg
+
+    async def _download_send_delete(
+        self,
+        target: Any,
+        msg: Message,
+        *,
+        chat_id: int,
+        chat_name: str,
+        progress_cb: Optional[ProgressCB] = None,
+    ) -> Path:
+        self._ensure_download_dir_ready()
+        work_dir = self.download_dir / f'{abs(chat_id)}_{msg.id}_{int(time.time() * 1000)}'
+        work_dir.mkdir(parents=True, exist_ok=True)
+        downloaded_path: Path | None = None
+        try:
+            if progress_cb:
+                await progress_cb({'type': 'download_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
+            self.heartbeat.beat(status='download_start', chat_id=chat_id, msg_id=msg.id)
+            downloaded = await self.client.download_media(msg, file=str(work_dir))
+            if not downloaded:
+                raise RuntimeError('download_media returned empty path')
+            downloaded_path = Path(downloaded)
+            if progress_cb:
+                await progress_cb({
+                    'type': 'download_done',
+                    'chat_id': chat_id,
+                    'chat_name': chat_name,
+                    'msg_id': msg.id,
+                    'local_path': str(downloaded_path),
+                })
+
+            self._ensure_upload_size_allowed(downloaded_path)
+            if progress_cb:
+                await progress_cb({'type': 'upload_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
+            self.heartbeat.beat(status='upload_start', chat_id=chat_id, msg_id=msg.id)
+            await self.client.send_file(target, downloaded_path, force_document=False, supports_streaming=True)
+            if progress_cb:
+                await progress_cb({'type': 'upload_done', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
+            self.heartbeat.beat(status='upload_done', chat_id=chat_id, msg_id=msg.id)
+            return downloaded_path
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            if progress_cb:
+                await progress_cb({'type': 'local_delete', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
+
+    async def _download_send_delete_with_retry(
+        self,
+        target: Any,
+        msg: Message,
+        *,
+        chat_id: int,
+        chat_name: str,
+        progress_cb: Optional[ProgressCB] = None,
+    ) -> None:
+        try:
+            await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
+        except FloodWaitError as e:
+            seconds = int(getattr(e, 'seconds', 1))
+            if progress_cb:
+                await progress_cb({'type': 'floodwait', 'chat_id': chat_id, 'seconds': seconds})
+            if seconds > self.max_flood_wait_sec:
+                raise
+            await asyncio.sleep(seconds + 1)
+            await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
+        except Exception as e:
+            if not _is_connection_error(e):
+                raise
+            log.warning('Connection error while download/upload chat_id=%s msg_id=%s: %s', chat_id, msg.id, e.__class__.__name__)
+            if not await self._recover_connection(f'download/upload chat_id={chat_id} msg_id={msg.id}'):
+                raise
+            await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
+
+    async def _send_local_file(
+        self,
+        target: Any,
+        file_path: Path,
+        *,
+        source_id: str,
+        source_name: str,
+        progress_cb: Optional[ProgressCB] = None,
+    ) -> None:
+        self._ensure_upload_size_allowed(file_path)
+        if progress_cb:
+            await progress_cb({'type': 'upload_start', 'source_id': source_id, 'chat_name': source_name, 'local_path': str(file_path)})
+        self.heartbeat.beat(status='upload_start', source_id=source_id, source_name=source_name)
+        await self.client.send_file(target, file_path, force_document=False, supports_streaming=True)
+        if progress_cb:
+            await progress_cb({'type': 'upload_done', 'source_id': source_id, 'chat_name': source_name, 'local_path': str(file_path)})
+        self.heartbeat.beat(status='upload_done', source_id=source_id, source_name=source_name)
+
+    async def _send_local_file_delete_with_retry(
+        self,
+        target: Any,
+        file_path: Path,
+        work_dir: Path,
+        *,
+        source_id: str,
+        source_name: str,
+        progress_cb: Optional[ProgressCB] = None,
+    ) -> None:
+        try:
+            try:
+                await self._send_local_file(
+                    target,
+                    file_path,
+                    source_id=source_id,
+                    source_name=source_name,
+                    progress_cb=progress_cb,
+                )
+            except FloodWaitError as e:
+                seconds = int(getattr(e, 'seconds', 1))
+                if progress_cb:
+                    await progress_cb({'type': 'floodwait', 'source_id': source_id, 'seconds': seconds})
+                if seconds > self.max_flood_wait_sec:
+                    raise
+                await asyncio.sleep(seconds + 1)
+                await self._send_local_file(
+                    target,
+                    file_path,
+                    source_id=source_id,
+                    source_name=source_name,
+                    progress_cb=progress_cb,
+                )
+            except Exception as e:
+                if not _is_connection_error(e):
+                    raise
+                log.warning('Connection error while uploading file source_id=%s: %s', source_id, e.__class__.__name__)
+                if not await self._recover_connection(f'upload file source_id={source_id}'):
+                    raise
+                await self._send_local_file(
+                    target,
+                    file_path,
+                    source_id=source_id,
+                    source_name=source_name,
+                    progress_cb=progress_cb,
+                )
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            if progress_cb:
+                await progress_cb({'type': 'local_delete', 'source_id': source_id, 'chat_name': source_name})
+
+    async def _download_external_video(
+        self,
+        url: str,
+        *,
+        work_dir: Path,
+        source_name: str,
+        progress_cb: Optional[ProgressCB] = None,
+    ) -> tuple[Path, dict[str, Any]]:
+        if progress_cb:
+            await progress_cb({'type': 'download_start', 'source_id': url, 'chat_name': source_name})
+        self.heartbeat.beat(status='download_start', source_id=url, source_name=source_name)
+
+        def run_download() -> dict[str, Any]:
+            if not shutil.which('ffmpeg'):
+                raise RuntimeError('Для скачивания лучшего качества нужен ffmpeg: yt-dlp часто скачивает видео и звук отдельно')
+            options = {
+                'format': 'bestvideo*+bestaudio/best',
+                'merge_output_format': 'mp4',
+                'outtmpl': str(work_dir / '%(extractor)s_%(id)s.%(ext)s'),
+                'noplaylist': True,
+                'playlist_items': '1',
+                'quiet': True,
+                'no_warnings': True,
+                'restrictfilenames': True,
+                'ignore_no_formats_error': False,
+                'max_filesize': self.max_upload_size,
+                'retries': 3,
+                'fragment_retries': 3,
+                'socket_timeout': 30,
+            }
+            if self.ytdlp_cookies_file:
+                options['cookiefile'] = str(self.ytdlp_cookies_file)
+            with yt_dlp.YoutubeDL(options) as ydl:
+                return ydl.extract_info(url, download=True)
+
+        info = await asyncio.to_thread(run_download)
+        files = [path for path in work_dir.iterdir() if path.is_file()]
+        if not files:
+            raise RuntimeError('yt-dlp did not create a video file')
+        downloaded_path = max(files, key=lambda path: path.stat().st_size)
+        if progress_cb:
+            await progress_cb({
+                'type': 'download_done',
+                'source_id': url,
+                'chat_name': source_name,
+                'local_path': str(downloaded_path),
+                'title': info.get('title'),
+            })
+        return downloaded_path, info
+
+    async def _process_external_video_url(self, url: str, progress_cb: Optional[ProgressCB] = None) -> dict[str, Any]:
+        clean_url = _clean_url(url)
+        start_ts = time.time()
+        source_name = _source_name_from_url(clean_url)
+        source_id = hashlib.sha1(f'{clean_url}:{start_ts}'.encode('utf-8')).hexdigest()[:16]
+        self._ensure_download_dir_ready()
+        work_dir = self.download_dir / f'external_{source_id}'
+        work_dir.mkdir(parents=True, exist_ok=True)
+        target = await self._run_with_connection_recovery(
+            f'get_entity:{self.target_bot_username}',
+            lambda: self.client.get_entity(self.target_bot_username),
+        )
+        try:
+            downloaded_path, info = await self._download_external_video(
+                clean_url,
+                work_dir=work_dir,
+                source_name=source_name,
+                progress_cb=progress_cb,
+            )
+            downloaded_size = downloaded_path.stat().st_size
+            await self._send_local_file_delete_with_retry(
+                target,
+                downloaded_path,
+                work_dir,
+                source_id=source_id,
+                source_name=source_name,
+                progress_cb=progress_cb,
+            )
+            return {
+                'link': clean_url,
+                'chat_name': source_name,
+                'title': info.get('title'),
+                'extractor': info.get('extractor_key') or info.get('extractor'),
+                'duration': int(info.get('duration') or 0),
+                'size': downloaded_size,
+                'elapsed_sec': int(time.time() - start_ts),
+            }
+        except Exception:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise
+
+    async def process_video_link(self, link: str, progress_cb: Optional[ProgressCB] = None) -> dict[str, Any]:
+        clean_link = _clean_url(link)
+        if not TELEGRAM_LINK_RE.search(clean_link):
+            return await self._process_external_video_url(clean_link, progress_cb=progress_cb)
+
+        start_ts = time.time()
+        target = await self._run_with_connection_recovery(
+            f'get_entity:{self.target_bot_username}',
+            lambda: self.client.get_entity(self.target_bot_username),
+        )
+        entity, msg = await self._run_with_connection_recovery('resolve_video_link', lambda: self._resolve_telegram_video_link(clean_link))
+        chat_id = int(getattr(entity, 'id', 0) or getattr(msg, 'chat_id', 0) or 0)
+        chat_name = getattr(entity, 'title', None) or getattr(entity, 'username', None) or str(chat_id)
+        meta = _extract_video_meta(msg)
+        if not meta:
+            raise ValueError('По ссылке найдено сообщение без видео')
+        w, h, duration, size = meta
+        await self._download_send_delete_with_retry(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
+        return {
+            'link': clean_link,
+            'chat_id': chat_id,
+            'chat_name': chat_name,
+            'message_id': int(msg.id),
+            'width': w,
+            'height': h,
+            'duration': duration,
+            'size': size,
+            'elapsed_sec': int(time.time() - start_ts),
+        }
 
     async def delete_dialog_by_id(self, chat_id: int) -> tuple[bool, str]:
         async with self._delete_lock:
@@ -409,33 +739,27 @@ class Scanner:
                         continue
 
                     try:
-                        await self.client.forward_messages(target, msg)
+                        await self._download_send_delete_with_retry(
+                            target,
+                            msg,
+                            chat_id=chat_id,
+                            chat_name=dialog_name,
+                            progress_cb=progress_cb,
+                        )
                     except FloodWaitError as e:
                         seconds = int(getattr(e, 'seconds', 1))
-                        if progress_cb:
-                            await progress_cb({'type': 'floodwait', 'chat_id': chat_id, 'seconds': seconds})
-                        if seconds > self.max_flood_wait_sec:
-                            total_errors += 1
-                            log.warning('FloodWait too long: %ss chat_id=%s msg_id=%s', seconds, chat_id, msg.id)
-                            cancelled = True
-                            cancel_event.set()
-                            break
-                        await asyncio.sleep(seconds + 1)
-                        await self.client.forward_messages(target, msg)
-                    except Exception as e:
-                        if not _is_connection_error(e):
-                            raise
-                        log.warning('Connection error while forwarding chat_id=%s msg_id=%s: %s', chat_id, msg.id, e.__class__.__name__)
-                        if not await self._recover_connection(f'forward chat_id={chat_id} msg_id={msg.id}'):
-                            raise
-                        await self.client.forward_messages(target, msg)
+                        total_errors += 1
+                        log.warning('FloodWait too long: %ss chat_id=%s msg_id=%s', seconds, chat_id, msg.id)
+                        cancelled = True
+                        cancel_event.set()
+                        break
 
                     await self.db.mark_forwarded(chat_id, msg.id, int(time.time()))
                     forwarded_in_chat += 1
                     total_forwarded += 1
 
                     log.info(
-                        'Forwarded: chat_id=%s msg_id=%s duration=%ss w=%s h=%s size=%s',
+                        'Uploaded: chat_id=%s msg_id=%s duration=%ss w=%s h=%s size=%s',
                         chat_id,
                         msg.id,
                         duration,
