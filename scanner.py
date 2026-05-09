@@ -513,11 +513,18 @@ class Scanner:
             _ensure_ytdlp_available()
             yt_dlp = importlib.import_module('yt_dlp')
 
-            if not shutil.which('ffmpeg'):
-                raise RuntimeError('Для скачивания лучшего качества нужен ffmpeg: yt-dlp часто скачивает видео и звук отдельно')
+            ffmpeg_path = shutil.which('ffmpeg')
+            if ffmpeg_path:
+                download_format = 'bestvideo*+bestaudio/best'
+                log.debug('Using ffmpeg for external video merge: %s', ffmpeg_path)
+            else:
+                download_format = 'best[ext=mp4]/best'
+                log.warning(
+                    'ffmpeg is not installed; downloading the best single-file stream instead of separate video/audio streams'
+                )
+
             options = {
-                'format': 'bestvideo*+bestaudio/best',
-                'merge_output_format': 'mp4',
+                'format': download_format,
                 'outtmpl': str(work_dir / '%(extractor)s_%(id)s.%(ext)s'),
                 'noplaylist': True,
                 'playlist_items': '1',
@@ -530,6 +537,8 @@ class Scanner:
                 'fragment_retries': 3,
                 'socket_timeout': 30,
             }
+            if ffmpeg_path:
+                options['merge_output_format'] = 'mp4'
             if self.ytdlp_cookies_file:
                 options['cookiefile'] = str(self.ytdlp_cookies_file)
             with yt_dlp.YoutubeDL(options) as ydl:
