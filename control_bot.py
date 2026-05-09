@@ -481,7 +481,7 @@ async def run_control_bot(
             labels = {
                 'download_start': 'ищу видео на странице и скачиваю лучшее качество',
                 'download_done': 'скачано, начинаю загрузку',
-                'upload_start': 'загружаю в @Content_Vertical_BOT',
+                'upload_start': f'загружаю в @{scanner.target_bot_username}',
                 'upload_done': 'загрузка завершена',
                 'local_delete': 'локальный файл удалён',
                 'floodwait': f'FloodWait {ev.get("seconds", 0)} сек',
@@ -550,8 +550,9 @@ async def run_control_bot(
                     title = item.get('title')
                     title_part = f' · {escape(_short_title(str(title), 40))}' if title else ''
                     message_part = f' #{item["message_id"]}' if item.get('message_id') else ''
+                    target_part = f' → @{scanner.target_bot_username} #{item["target_message_id"]}' if item.get('target_message_id') else ''
                     lines.append(
-                        f'  • {source}{message_part}{title_part} · {_format_duration(item.get("elapsed_sec", 0))}'
+                        f'  • {source}{message_part}{title_part}{target_part} · {_format_duration(item.get("elapsed_sec", 0))}'
                     )
             if errors:
                 lines.append('')
