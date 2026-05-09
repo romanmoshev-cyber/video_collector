@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -20,7 +21,12 @@ from watchdog import Heartbeat
 
 log = logging.getLogger('scanner')
 MB = 1024 * 1024
+STALE_DOWNLOAD_MAX_AGE_SEC = 6 * 60 * 60
 ProgressCB = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+class InsufficientDownloadSpaceError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -120,6 +126,7 @@ class Scanner:
         excluded_chat_ids: set[int],
         target_bot_username: str,
         downloads_dir: Path,
+        downloads_reserve_mb: int,
         forward_delay_sec: float,
         forward_jitter_sec: float,
         dialog_delay_sec: float,
@@ -132,6 +139,7 @@ class Scanner:
         self.excluded = excluded_chat_ids
         self.target_bot_username = target_bot_username
         self.downloads_dir = Path(downloads_dir)
+        self.downloads_reserve_bytes = max(0, downloads_reserve_mb) * MB
         self.forward_delay_sec = max(0.3, forward_delay_sec)
         self.forward_jitter_sec = max(0.0, forward_jitter_sec)
         self.dialog_delay_sec = max(0.0, dialog_delay_sec)
@@ -287,8 +295,40 @@ class Scanner:
                 log.exception('delete_dialog_by_id failed chat_id=%s', chat_id)
                 return False, f'Ошибка: {e.__class__.__name__}'
 
-    async def _download_and_send_video(self, target: Any, msg: Message) -> None:
+    def _cleanup_stale_downloads(self) -> None:
+        now = time.time()
+        for item in self.downloads_dir.glob('video_*'):
+            try:
+                if now - item.stat().st_mtime < STALE_DOWNLOAD_MAX_AGE_SEC:
+                    continue
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+                log.info('Removed stale download item: %s', item)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                log.warning('Failed to remove stale download item: %s', item, exc_info=True)
+
+    def _ensure_download_space(self, expected_size: int) -> None:
+        usage = shutil.disk_usage(self.downloads_dir)
+        required = max(int(expected_size or 0) + self.downloads_reserve_bytes, self.downloads_reserve_bytes)
+        if usage.free >= required:
+            return
+
+        free_mb = usage.free // MB
+        required_mb = required // MB
+        video_mb = int(expected_size or 0) // MB
+        raise InsufficientDownloadSpaceError(
+            f'Недостаточно свободного места в DOWNLOADS_DIR: {free_mb} МБ, '
+            f'нужно минимум {required_mb} МБ (видео {video_mb} МБ + резерв {self.downloads_reserve_bytes // MB} МБ)'
+        )
+
+    async def _download_and_send_video(self, target: Any, msg: Message, expected_size: int) -> None:
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_downloads()
+        self._ensure_download_space(expected_size)
         with tempfile.TemporaryDirectory(prefix=f'video_{msg.chat_id}_{msg.id}_', dir=self.downloads_dir) as tmp_dir:
             downloaded = await self.client.download_media(msg, file=tmp_dir)
             if not downloaded:
@@ -305,8 +345,8 @@ class Scanner:
                 supports_streaming=True,
             )
 
-    async def _deliver_video(self, target: Any, msg: Message) -> None:
-        await self._download_and_send_video(target, msg)
+    async def _deliver_video(self, target: Any, msg: Message, expected_size: int) -> None:
+        await self._download_and_send_video(target, msg, expected_size)
 
     async def scan(
         self,
@@ -434,7 +474,7 @@ class Scanner:
                         continue
 
                     try:
-                        await self._deliver_video(target, msg)
+                        await self._deliver_video(target, msg, size)
                     except FloodWaitError as e:
                         seconds = int(getattr(e, 'seconds', 1))
                         if progress_cb:
@@ -446,14 +486,25 @@ class Scanner:
                             cancel_event.set()
                             break
                         await asyncio.sleep(seconds + 1)
-                        await self._deliver_video(target, msg)
+                        await self._deliver_video(target, msg, size)
+                    except InsufficientDownloadSpaceError as e:
+                        total_errors += 1
+                        log.warning(
+                            'Skip video because DOWNLOADS_DIR has not enough space: chat_id=%s msg_id=%s error=%s',
+                            chat_id,
+                            msg.id,
+                            e,
+                        )
+                        if progress_cb:
+                            await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': str(e)})
+                        continue
                     except Exception as e:
                         if not _is_connection_error(e):
                             raise
                         log.warning('Connection error while delivering chat_id=%s msg_id=%s: %s', chat_id, msg.id, e.__class__.__name__)
                         if not await self._recover_connection(f'deliver chat_id={chat_id} msg_id={msg.id}'):
                             raise
-                        await self._deliver_video(target, msg)
+                        await self._deliver_video(target, msg, size)
 
                     await self.db.mark_forwarded(chat_id, msg.id, int(time.time()))
                     forwarded_in_chat += 1

@@ -103,6 +103,7 @@ async def async_main() -> None:
             excluded_chat_ids=cfg.excluded_chat_ids,
             target_bot_username=cfg.target_bot_username,
             downloads_dir=cfg.downloads_dir,
+            downloads_reserve_mb=cfg.downloads_reserve_mb,
             forward_delay_sec=cfg.forward_delay_sec,
             forward_jitter_sec=cfg.forward_jitter_sec,
             dialog_delay_sec=cfg.dialog_delay_sec,
