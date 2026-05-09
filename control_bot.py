@@ -13,10 +13,10 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from scanner import ScanOptions, Scanner
+from scanner import ScanOptions, Scanner, _format_bytes
 from watchdog import Heartbeat
 
 log = logging.getLogger('control_bot')
@@ -50,7 +50,9 @@ _MAIN_MENU_LABELS = {
     'reports': '📊 Отчёты',
     'empty': '🧹 Пустые',
     'excluded': '🚫 Исключения',
+    'link_stats': '🔗 Ссылки',
     'status': '📄 Статус',
+    'hide': '🙈 Скрыть меню',
     'stop': '⛔ Стоп',
     'help': 'ℹ️ Помощь',
 }
@@ -60,9 +62,10 @@ def _menu_kb(is_scanning: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text=_MAIN_MENU_LABELS['scan_all']), KeyboardButton(text=_MAIN_MENU_LABELS['pick'])],
         [KeyboardButton(text=_MAIN_MENU_LABELS['mode']), KeyboardButton(text=_MAIN_MENU_LABELS['order'])],
-        [KeyboardButton(text=_MAIN_MENU_LABELS['reports']), KeyboardButton(text=_MAIN_MENU_LABELS['empty'])],
-        [KeyboardButton(text=_MAIN_MENU_LABELS['excluded']), KeyboardButton(text=_MAIN_MENU_LABELS['status'])],
-        [KeyboardButton(text=_MAIN_MENU_LABELS['help'])],
+        [KeyboardButton(text=_MAIN_MENU_LABELS['reports']), KeyboardButton(text=_MAIN_MENU_LABELS['link_stats'])],
+        [KeyboardButton(text=_MAIN_MENU_LABELS['empty']), KeyboardButton(text=_MAIN_MENU_LABELS['excluded'])],
+        [KeyboardButton(text=_MAIN_MENU_LABELS['status']), KeyboardButton(text=_MAIN_MENU_LABELS['help'])],
+        [KeyboardButton(text=_MAIN_MENU_LABELS['hide'])],
     ]
     if is_scanning:
         rows[-1].append(KeyboardButton(text=_MAIN_MENU_LABELS['stop']))
@@ -116,14 +119,15 @@ def _main_kb(is_scanning: bool):
     kb.button(text='⏱ Период', callback_data='mode:open')
     kb.button(text='🔁 Порядок', callback_data='order:open')
     kb.button(text='📊 Отчёты', callback_data='reports:menu')
+    kb.button(text='🔗 Ссылки', callback_data='link_stats')
     kb.button(text='🧹 Пустые', callback_data='empty:list')
     kb.button(text='🚫 Исключения', callback_data='excluded:list')
     kb.button(text='📄 Статус', callback_data='status')
     if is_scanning:
         kb.button(text='⛔ Стоп', callback_data='scan:stop')
-        kb.adjust(2, 2, 2, 2, 1)
+        kb.adjust(2, 2, 2, 2, 1, 1)
     else:
-        kb.adjust(2, 2, 2, 2)
+        kb.adjust(2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -148,8 +152,8 @@ def _help_text() -> str:
         '/status — показать состояние процесса и heartbeat.\n'
         '/help — краткая справка.\n\n'
         'Можно просто прислать одну или несколько ссылок на страницы с видео — бот сам найдёт видео, выберет лучшее качество, поставит в очередь, '
-        'скачает на сервер, отправит в @Content_Vertical_BOT и удалит локальный файл. Если прислать ссылки во время загрузки, '
-        'они добавятся в конец текущей очереди.\n\n'
+        'скачает на сервер, покажет разрешение и размер, создаст превью, отправит в @Content_Vertical_BOT и удалит локальный файл. '
+        'Если прислать ссылки во время загрузки, они добавятся в конец текущей очереди. Кнопка «🔗 Ссылки» показывает статистику ручных загрузок.\n\n'
         'Для сканирования: выбери период, выбери чаты или запусти поиск по всем, затем смотри отчёт. '
         'Для безопасной проверки удаления пустых чатов включи <code>DRY_RUN_DELETE=true</code>.'
     )
@@ -292,6 +296,50 @@ def _transfer_line(state: dict[str, Any]) -> str:
     if current and total:
         return f'\nПрогресс этапа: <b>{escape(str(percent))}%</b> · <b>{escape(str(current))}</b> / <b>{escape(str(total))}</b>'
     return f'\nПрогресс этапа: <b>{escape(str(percent))}%</b>'
+
+
+def _media_details_line(state: dict[str, Any]) -> str:
+    parts = []
+    if state.get('resolution'):
+        parts.append(f'разрешение <b>{escape(str(state["resolution"]))}</b>')
+    if state.get('size_human'):
+        parts.append(f'размер <b>{escape(str(state["size_human"]))}</b>')
+    if state.get('duration'):
+        parts.append(f'длительность <b>{_format_duration(state["duration"])}</b>')
+    if state.get('thumb_status'):
+        parts.append(f'превью <b>{escape(str(state["thumb_status"]))}</b>')
+    return 'Видео: ' + ' · '.join(parts) if parts else ''
+
+
+def _format_link_stats(stats: dict[str, Any]) -> str:
+    lines = [
+        '🔗 <b>Статистика ссылок</b>',
+        f'Всего задач: <b>{stats.get("total", 0)}</b>',
+        f'Успешно: <b>{stats.get("ok", 0)}</b>',
+        f'Ошибок: <b>{stats.get("errors", 0)}</b>',
+        f'Загружено данных: <b>{_format_bytes(stats.get("bytes_uploaded", 0))}</b>',
+        f'Длительность видео: <b>{_format_duration(stats.get("duration_sec", 0))}</b>',
+        '',
+        '🕘 <b>Последние задачи</b>',
+    ]
+    recent = stats.get('recent') or []
+    if not recent:
+        lines.append('Пока нет ручных загрузок по ссылкам.')
+        return '\n'.join(lines)
+    for item in recent:
+        mark = '✅' if item.get('status') == 'ok' else '❌'
+        title = item.get('title') or item.get('source_name') or item.get('link') or 'ссылка'
+        details = []
+        if item.get('resolution'):
+            details.append(str(item['resolution']))
+        if item.get('size'):
+            details.append(_format_bytes(item['size']))
+        if item.get('duration'):
+            details.append(_format_duration(item['duration']))
+        suffix = f' · {escape(" · ".join(details))}' if details else ''
+        error = f' · <code>{escape(str(item.get("error") or "")[:80])}</code>' if item.get('error') else ''
+        lines.append(f'{mark} {escape(_short_title(str(title), 34))}{suffix}{error}')
+    return '\n'.join(lines)
 
 def _format_duration(seconds: int | float) -> str:
     seconds = int(seconds or 0)
@@ -521,6 +569,9 @@ async def run_control_bot(
             f'Источник: <b>{escape(str(state.get("chat_name") or "—"))}</b>',
             f'Этап: <b>{escape(str(state.get("stage") or "старт"))}</b>',
         ]
+        media_details = _media_details_line(state)
+        if media_details:
+            lines.append(media_details)
         transfer = _transfer_line(state)
         if transfer:
             lines.append(transfer.lstrip('\n'))
@@ -603,6 +654,19 @@ async def run_control_bot(
             state['stage'] = labels.get(event_type, str(event_type or state['stage']))
             if ev.get('chat_name'):
                 state['chat_name'] = ev['chat_name']
+            if event_type == 'download_done':
+                for key in ('resolution', 'size_human', 'duration'):
+                    if ev.get(key):
+                        state[key] = ev[key]
+            if event_type == 'thumbnail_done':
+                state['thumb_status'] = 'готово' if ev.get('thumb_path') else 'нет'
+                if ev.get('thumb_size_human') and ev.get('thumb_path'):
+                    state['thumb_status'] = f'готово, {ev["thumb_size_human"]}'
+            if event_type == 'upload_start':
+                if ev.get('size_human'):
+                    state['size_human'] = ev['size_human']
+                if ev.get('has_thumbnail') is not None and not state.get('thumb_status'):
+                    state['thumb_status'] = 'готово' if ev.get('has_thumbnail') else 'нет'
             if event_type in {'download_progress', 'upload_progress'}:
                 state['percent'] = ev.get('percent')
                 state['current_human'] = ev.get('current_human')
@@ -640,6 +704,8 @@ async def run_control_bot(
                     state['total'] = link_queue_total
                     state['stage'] = 'обрабатываю ссылку'
                     state['chat_name'] = '—'
+                    for transient_key in ('resolution', 'size_human', 'duration', 'thumb_status', 'percent', 'current_human', 'total_human'):
+                        state.pop(transient_key, None)
                     await safe_edit_text(
                         progress_msg,
                         link_queue_summary_text(state) + f'\nСсылка: <code>{escape(entry.link)}</code>',
@@ -647,9 +713,18 @@ async def run_control_bot(
                     try:
                         result = await scanner.process_video_link(entry.link, progress_cb=link_progress_cb)
                         results.append(result)
+                        await scanner.db.add_link_upload({**result, 'status': 'ok', 'created_at': int(time.time())})
                     except Exception as e:
                         log.exception('failed to process video link')
-                        errors.append(f'{entry.link} — {e.__class__.__name__}: {e}')
+                        error_text = f'{entry.link} — {e.__class__.__name__}: {e}'
+                        errors.append(error_text)
+                        await scanner.db.add_link_upload({
+                            'link': entry.link,
+                            'source_name': 'ссылка',
+                            'status': 'error',
+                            'error': f'{e.__class__.__name__}: {e}',
+                            'created_at': int(time.time()),
+                        })
                 link_queue_accepting = False
                 heartbeat.beat(status='link_queue_done', user_id=message.from_user.id, ok=len(results), errors=len(errors))
 
@@ -668,8 +743,16 @@ async def run_control_bot(
                         title_part = f' · {escape(_short_title(str(title), 40))}' if title else ''
                         message_part = f' #{item["message_id"]}' if item.get('message_id') else ''
                         target_part = f' → @{scanner.target_bot_username} #{item["target_message_id"]}' if item.get('target_message_id') else ''
+                        details = []
+                        if item.get('resolution'):
+                            details.append(str(item['resolution']))
+                        if item.get('size_human'):
+                            details.append(str(item['size_human']))
+                        elif item.get('size'):
+                            details.append(_format_bytes(item['size']))
+                        media_part = f' · {escape(" · ".join(details))}' if details else ''
                         lines.append(
-                            f'  • {source}{message_part}{title_part}{target_part} · {_format_duration(item.get("elapsed_sec", 0))}'
+                            f'  • {source}{message_part}{title_part}{target_part}{media_part} · {_format_duration(item.get("elapsed_sec", 0))}'
                         )
                 if errors:
                     lines.append('')
@@ -767,6 +850,8 @@ async def run_control_bot(
                 state['chat_index'] = ev.get('chat_index', 0)
                 state['chat_name'] = ev.get('chat_name', '—')
                 state['msg_id'] = None
+                for transient_key in ('resolution', 'size_human', 'duration', 'thumb_status'):
+                    state.pop(transient_key, None)
             elif event_type in {'tick', 'forward', 'chat_done', 'done'}:
                 state['checked'] = ev.get('checked', state['checked'])
                 state['matched'] = ev.get('matched', state['matched'])
@@ -777,6 +862,12 @@ async def run_control_bot(
                 state['floodwait'] = ev.get('seconds')
             if ev.get('chat_name'):
                 state['chat_name'] = ev['chat_name']
+            if event_type == 'download_done':
+                for key in ('resolution', 'size_human', 'duration'):
+                    if ev.get(key):
+                        state[key] = ev[key]
+            if event_type == 'thumbnail_done':
+                state['thumb_status'] = 'готово' if ev.get('thumb_path') else 'нет'
             if event_type in {'download_progress', 'upload_progress'}:
                 state['percent'] = ev.get('percent')
                 state['current_human'] = ev.get('current_human')
@@ -810,6 +901,7 @@ async def run_control_bot(
                 f'Загружено: <b>{state["forwarded"]}</b>\n'
                 f'Этап: <b>{escape(str(state["stage"]))}</b>'
                 f'{msg_line}'
+                f'{("\n" + _media_details_line(state)) if _media_details_line(state) else ""}'
                 f'{_transfer_line(state)}'
                 f'{fw_line}'
             )
@@ -918,6 +1010,16 @@ async def run_control_bot(
             await m.answer('🔁 <b>Порядок сканирования</b>\nС какой стороны читать историю:', reply_markup=_order_kb(st.order))
         elif text == _MAIN_MENU_LABELS['reports']:
             await m.answer(_reports_menu_text(), reply_markup=_reports_menu_kb())
+        elif text == _MAIN_MENU_LABELS['link_stats']:
+            await m.answer(_format_link_stats(await scanner.db.get_link_stats()), reply_markup=_menu_kb(scan_lock.locked()))
+        elif text == _MAIN_MENU_LABELS['hide']:
+            await m.answer(
+                '🙈 Меню скрыто. Чтобы вернуть кнопки, отправь /start или нажми кнопку в этом сообщении.',
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            kb = InlineKeyboardBuilder()
+            kb.button(text='🏠 Показать меню', callback_data='back:main')
+            await m.answer('Быстрый возврат:', reply_markup=kb.as_markup())
         elif text == _MAIN_MENU_LABELS['empty']:
             msg = await m.answer('Открываю список пустых…', reply_markup=_menu_kb(scan_lock.locked()))
             await render_empty_list(msg, st)
@@ -940,7 +1042,7 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         heartbeat.beat(status='back_main', user_id=c.from_user.id)
-        await safe_edit_text(c.message, _main_text(st, scan_lock.locked()), reply_markup=_menu_kb(is_scanning=scan_lock.locked()))
+        await safe_edit_text(c.message, _main_text(st, scan_lock.locked()), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
         await c.answer()
 
     @dp.callback_query(F.data == 'mode:open')
@@ -1087,7 +1189,14 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         await c.answer()
-        await safe_edit_text(c.message, _status_text(st, heartbeat, scan_lock.locked()), reply_markup=_menu_kb(scan_lock.locked()))
+        await safe_edit_text(c.message, _status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
+
+    @dp.callback_query(F.data == 'link_stats')
+    async def link_stats(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        await c.answer()
+        await safe_edit_text(c.message, _format_link_stats(await scanner.db.get_link_stats()), reply_markup=_main_kb(scan_lock.locked()))
 
     @dp.callback_query(F.data == 'reports:menu')
     async def reports_menu(c: CallbackQuery):
