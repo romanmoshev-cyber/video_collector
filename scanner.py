@@ -86,6 +86,38 @@ def _matches_rules(w: int, h: int, duration: int, size: int) -> bool:
     return _reject_reason(w, h, duration, size) is None
 
 
+def _video_attributes_from_values(width: Any, height: Any, duration: Any) -> list[DocumentAttributeVideo] | None:
+    try:
+        w = int(width or 0)
+        h = int(height or 0)
+        d = float(duration or 0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0 or d <= 0:
+        return None
+    return [DocumentAttributeVideo(duration=d, w=w, h=h, supports_streaming=True)]
+
+
+def _video_attributes_from_info(info: dict[str, Any]) -> list[DocumentAttributeVideo] | None:
+    candidates: list[dict[str, Any]] = [info]
+    for key in ('requested_downloads', 'requested_formats'):
+        values = info.get(key)
+        if isinstance(values, list):
+            candidates.extend(item for item in values if isinstance(item, dict))
+    for item in candidates:
+        attrs = _video_attributes_from_values(item.get('width'), item.get('height'), item.get('duration') or info.get('duration'))
+        if attrs:
+            return attrs
+    return None
+
+
+def _sent_message_id(sent: Any) -> int | None:
+    if isinstance(sent, list):
+        sent = sent[0] if sent else None
+    msg_id = getattr(sent, 'id', None)
+    return int(msg_id) if msg_id else None
+
+
 SKIPPED_DIALOG_NAMES = {'избранное', 'saved messages', 'подборки 18+'}
 SKIPPED_DIALOG_PREFIXES = ('vertical',)
 
@@ -365,7 +397,7 @@ class Scanner:
         chat_id: int,
         chat_name: str,
         progress_cb: Optional[ProgressCB] = None,
-    ) -> Path:
+    ) -> int:
         self._ensure_download_dir_ready()
         work_dir = self.download_dir / f'{abs(chat_id)}_{msg.id}_{int(time.time() * 1000)}'
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -391,11 +423,22 @@ class Scanner:
             if progress_cb:
                 await progress_cb({'type': 'upload_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
             self.heartbeat.beat(status='upload_start', chat_id=chat_id, msg_id=msg.id)
-            await self.client.send_file(target, downloaded_path, force_document=False, supports_streaming=True)
+            meta = _extract_video_meta(msg)
+            attributes = _video_attributes_from_values(meta[0], meta[1], meta[2]) if meta else None
+            sent = await self.client.send_file(
+                target,
+                downloaded_path,
+                force_document=False,
+                supports_streaming=True,
+                attributes=attributes,
+            )
+            sent_msg_id = _sent_message_id(sent)
+            if not sent_msg_id:
+                raise RuntimeError('Telegram did not return a message id after upload')
             if progress_cb:
-                await progress_cb({'type': 'upload_done', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
-            self.heartbeat.beat(status='upload_done', chat_id=chat_id, msg_id=msg.id)
-            return downloaded_path
+                await progress_cb({'type': 'upload_done', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id, 'target_msg_id': sent_msg_id})
+            self.heartbeat.beat(status='upload_done', chat_id=chat_id, msg_id=msg.id, target_msg_id=sent_msg_id)
+            return sent_msg_id
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
             if progress_cb:
@@ -409,9 +452,9 @@ class Scanner:
         chat_id: int,
         chat_name: str,
         progress_cb: Optional[ProgressCB] = None,
-    ) -> None:
+    ) -> int:
         try:
-            await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
+            return await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
         except FloodWaitError as e:
             seconds = int(getattr(e, 'seconds', 1))
             if progress_cb:
@@ -419,14 +462,14 @@ class Scanner:
             if seconds > self.max_flood_wait_sec:
                 raise
             await asyncio.sleep(seconds + 1)
-            await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
+            return await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
         except Exception as e:
             if not _is_connection_error(e):
                 raise
             log.warning('Connection error while download/upload chat_id=%s msg_id=%s: %s', chat_id, msg.id, e.__class__.__name__)
             if not await self._recover_connection(f'download/upload chat_id={chat_id} msg_id={msg.id}'):
                 raise
-            await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
+            return await self._download_send_delete(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
 
     async def _send_local_file(
         self,
@@ -435,16 +478,33 @@ class Scanner:
         *,
         source_id: str,
         source_name: str,
+        attributes: list[DocumentAttributeVideo] | None = None,
         progress_cb: Optional[ProgressCB] = None,
-    ) -> None:
+    ) -> int:
         self._ensure_upload_size_allowed(file_path)
         if progress_cb:
             await progress_cb({'type': 'upload_start', 'source_id': source_id, 'chat_name': source_name, 'local_path': str(file_path)})
         self.heartbeat.beat(status='upload_start', source_id=source_id, source_name=source_name)
-        await self.client.send_file(target, file_path, force_document=False, supports_streaming=True)
+        sent = await self.client.send_file(
+            target,
+            file_path,
+            force_document=False,
+            supports_streaming=True,
+            attributes=attributes,
+        )
+        sent_msg_id = _sent_message_id(sent)
+        if not sent_msg_id:
+            raise RuntimeError('Telegram did not return a message id after upload')
         if progress_cb:
-            await progress_cb({'type': 'upload_done', 'source_id': source_id, 'chat_name': source_name, 'local_path': str(file_path)})
-        self.heartbeat.beat(status='upload_done', source_id=source_id, source_name=source_name)
+            await progress_cb({
+                'type': 'upload_done',
+                'source_id': source_id,
+                'chat_name': source_name,
+                'local_path': str(file_path),
+                'target_msg_id': sent_msg_id,
+            })
+        self.heartbeat.beat(status='upload_done', source_id=source_id, source_name=source_name, target_msg_id=sent_msg_id)
+        return sent_msg_id
 
     async def _send_local_file_delete_with_retry(
         self,
@@ -454,15 +514,17 @@ class Scanner:
         *,
         source_id: str,
         source_name: str,
+        attributes: list[DocumentAttributeVideo] | None = None,
         progress_cb: Optional[ProgressCB] = None,
-    ) -> None:
+    ) -> int:
         try:
             try:
-                await self._send_local_file(
+                return await self._send_local_file(
                     target,
                     file_path,
                     source_id=source_id,
                     source_name=source_name,
+                    attributes=attributes,
                     progress_cb=progress_cb,
                 )
             except FloodWaitError as e:
@@ -472,11 +534,12 @@ class Scanner:
                 if seconds > self.max_flood_wait_sec:
                     raise
                 await asyncio.sleep(seconds + 1)
-                await self._send_local_file(
+                return await self._send_local_file(
                     target,
                     file_path,
                     source_id=source_id,
                     source_name=source_name,
+                    attributes=attributes,
                     progress_cb=progress_cb,
                 )
             except Exception as e:
@@ -485,11 +548,12 @@ class Scanner:
                 log.warning('Connection error while uploading file source_id=%s: %s', source_id, e.__class__.__name__)
                 if not await self._recover_connection(f'upload file source_id={source_id}'):
                     raise
-                await self._send_local_file(
+                return await self._send_local_file(
                     target,
                     file_path,
                     source_id=source_id,
                     source_name=source_name,
+                    attributes=attributes,
                     progress_cb=progress_cb,
                 )
         finally:
@@ -579,12 +643,14 @@ class Scanner:
                 progress_cb=progress_cb,
             )
             downloaded_size = downloaded_path.stat().st_size
-            await self._send_local_file_delete_with_retry(
+            attributes = _video_attributes_from_info(info)
+            target_msg_id = await self._send_local_file_delete_with_retry(
                 target,
                 downloaded_path,
                 work_dir,
                 source_id=source_id,
                 source_name=source_name,
+                attributes=attributes,
                 progress_cb=progress_cb,
             )
             return {
@@ -594,6 +660,7 @@ class Scanner:
                 'extractor': info.get('extractor_key') or info.get('extractor'),
                 'duration': int(info.get('duration') or 0),
                 'size': downloaded_size,
+                'target_message_id': target_msg_id,
                 'elapsed_sec': int(time.time() - start_ts),
             }
         except Exception:
@@ -617,7 +684,7 @@ class Scanner:
         if not meta:
             raise ValueError('По ссылке найдено сообщение без видео')
         w, h, duration, size = meta
-        await self._download_send_delete_with_retry(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
+        target_msg_id = await self._download_send_delete_with_retry(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
         return {
             'link': clean_link,
             'chat_id': chat_id,
@@ -627,6 +694,7 @@ class Scanner:
             'height': h,
             'duration': duration,
             'size': size,
+            'target_message_id': target_msg_id,
             'elapsed_sec': int(time.time() - start_ts),
         }
 
