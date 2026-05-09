@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/video_collector_fixed
-ExecStart=%h/video_collector_fixed/run.sh
+WorkingDirectory=%h/video_collector
+ExecStart=%h/video_collector/run.sh
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

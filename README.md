@@ -31,6 +31,23 @@
 - Ширина: w >= 900
 - Размер: >= 10 МБ на минуту (пропорционально)
 
+
+## Linux / systemd
+```bash
+cd /home/botuser/video_collector
+cp .env.example .env  # если файла .env ещё нет, затем заполни токены
+./run.sh
+```
+
+`run.sh` сам создаёт `venv`, устанавливает зависимости из `requirements.txt` и запускает `main.py`. Поэтому при ошибке вида `ModuleNotFoundError: No module named 'yt_dlp'` нужно запускать сервис через `run.sh` или один раз выполнить `./run.sh` вручную, чтобы зависимости попали в виртуальное окружение.
+
+Для systemd используй `video_collector.service`: он ожидает проект в `%h/video_collector` и стартует `%h/video_collector/run.sh`. После обновления unit-файла выполни:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart video_collector
+sudo journalctl -u video_collector -n 100 -f
+```
+
 ## Windows PowerShell
 ```powershell
 python -m venv venv
