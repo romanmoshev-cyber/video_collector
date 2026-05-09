@@ -29,6 +29,56 @@ MB = 1024 * 1024
 ProgressCB = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+def _format_bytes(value: Any) -> str:
+    try:
+        size = float(value or 0)
+    except (TypeError, ValueError):
+        return '0 Б'
+    units = ('Б', 'КБ', 'МБ', 'ГБ')
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
+        size /= 1024
+        idx += 1
+    if idx == 0:
+        return f'{int(size)} {units[idx]}'
+    return f'{size:.1f} {units[idx]}'
+
+
+def _make_transfer_progress_callback(
+    progress_cb: Optional[ProgressCB],
+    event_type: str,
+    base_event: dict[str, Any],
+    *,
+    min_interval_sec: float = 1.5,
+):
+    if progress_cb is None:
+        return None
+
+    loop = asyncio.get_running_loop()
+    last_emit = 0.0
+
+    def on_progress(current: int, total: int) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        is_done = bool(total and current >= total)
+        if not is_done and now - last_emit < min_interval_sec:
+            return
+        last_emit = now
+        percent = round((current / total) * 100, 1) if total else 0.0
+        event = {
+            **base_event,
+            'type': event_type,
+            'current': int(current or 0),
+            'total': int(total or 0),
+            'percent': percent,
+            'current_human': _format_bytes(current),
+            'total_human': _format_bytes(total),
+        }
+        loop.create_task(progress_cb(event))
+
+    return on_progress
+
+
 @dataclass
 class ScanOptions:
     mode: str
@@ -137,31 +187,34 @@ def _generate_video_thumbnail(video_path: Path, work_dir: Path, source_id: str, 
     seek_sec = max(0.0, min(3.0, duration_sec / 3.0)) if duration_sec else 1.0
 
     thumb_path = work_dir / f'{source_id}_thumb.jpg'
-    for quality in (5, 8, 12, 16, 20):
-        cmd = [
-            ffmpeg_path,
-            '-y',
-            '-ss',
-            f'{seek_sec:.3f}',
-            '-i',
-            str(video_path),
-            '-frames:v',
-            '1',
-            '-vf',
-            'scale=320:320:force_original_aspect_ratio=decrease',
-            '-q:v',
-            str(quality),
-            str(thumb_path),
-        ]
-        completed = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if completed.returncode != 0 or not thumb_path.exists() or thumb_path.stat().st_size <= 0:
-            continue
-        if thumb_path.stat().st_size <= 20 * 1024:
-            return thumb_path
+    max_size = 20 * 1024
+    for side in (320, 288, 256, 224, 192):
+        for quality in (8, 12, 16, 20, 24, 28, 31):
+            cmd = [
+                ffmpeg_path,
+                '-y',
+                '-ss',
+                f'{seek_sec:.3f}',
+                '-i',
+                str(video_path),
+                '-map',
+                '0:v:0',
+                '-frames:v',
+                '1',
+                '-vf',
+                f'scale={side}:{side}:force_original_aspect_ratio=decrease',
+                '-q:v',
+                str(quality),
+                str(thumb_path),
+            ]
+            completed = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if completed.returncode != 0 or not thumb_path.exists() or thumb_path.stat().st_size <= 0:
+                continue
+            if thumb_path.stat().st_size <= max_size:
+                return thumb_path
 
     if thumb_path.exists() and thumb_path.stat().st_size > 0:
-        log.debug('Generated thumbnail is larger than Telegram recommendation: %s bytes', thumb_path.stat().st_size)
-        return thumb_path
+        log.warning('Generated thumbnail is too large for Telegram custom cover: %s bytes', thumb_path.stat().st_size)
     return None
 
 
@@ -460,7 +513,15 @@ class Scanner:
             if progress_cb:
                 await progress_cb({'type': 'download_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
             self.heartbeat.beat(status='download_start', chat_id=chat_id, msg_id=msg.id)
-            downloaded = await self.client.download_media(msg, file=str(work_dir))
+            downloaded = await self.client.download_media(
+                msg,
+                file=str(work_dir),
+                progress_callback=_make_transfer_progress_callback(
+                    progress_cb,
+                    'download_progress',
+                    {'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id},
+                ),
+            )
             if not downloaded:
                 raise RuntimeError('download_media returned empty path')
             downloaded_path = Path(downloaded)
@@ -479,6 +540,8 @@ class Scanner:
             self.heartbeat.beat(status='upload_start', chat_id=chat_id, msg_id=msg.id)
             meta = _extract_video_meta(msg)
             attributes = _video_attributes_from_values(meta[0], meta[1], meta[2]) if meta else None
+            if progress_cb:
+                await progress_cb({'type': 'thumbnail_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
             thumb = await asyncio.to_thread(
                 _generate_video_thumbnail,
                 downloaded_path,
@@ -486,6 +549,15 @@ class Scanner:
                 f'{abs(chat_id)}_{msg.id}',
                 meta[2] if meta else None,
             )
+            if progress_cb:
+                await progress_cb({
+                    'type': 'thumbnail_done',
+                    'chat_id': chat_id,
+                    'chat_name': chat_name,
+                    'msg_id': msg.id,
+                    'thumb_path': str(thumb) if thumb else None,
+                    'thumb_size': thumb.stat().st_size if thumb and thumb.exists() else 0,
+                })
             sent = await self.client.send_file(
                 target,
                 downloaded_path,
@@ -493,6 +565,11 @@ class Scanner:
                 supports_streaming=True,
                 attributes=attributes,
                 thumb=thumb,
+                progress_callback=_make_transfer_progress_callback(
+                    progress_cb,
+                    'upload_progress',
+                    {'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id},
+                ),
             )
             sent_msg_id = _sent_message_id(sent)
             if not sent_msg_id:
@@ -555,6 +632,11 @@ class Scanner:
             supports_streaming=True,
             attributes=attributes,
             thumb=thumb,
+            progress_callback=_make_transfer_progress_callback(
+                progress_cb,
+                'upload_progress',
+                {'source_id': source_id, 'chat_name': source_name, 'local_path': str(file_path)},
+            ),
         )
         sent_msg_id = _sent_message_id(sent)
         if not sent_msg_id:
@@ -715,6 +797,8 @@ class Scanner:
             downloaded_size = downloaded_path.stat().st_size
             attributes = _video_attributes_from_info(info)
             duration = info.get('duration')
+            if progress_cb:
+                await progress_cb({'type': 'thumbnail_start', 'source_id': source_id, 'chat_name': source_name})
             thumb = await asyncio.to_thread(
                 _generate_video_thumbnail,
                 downloaded_path,
@@ -722,6 +806,14 @@ class Scanner:
                 source_id,
                 duration,
             )
+            if progress_cb:
+                await progress_cb({
+                    'type': 'thumbnail_done',
+                    'source_id': source_id,
+                    'chat_name': source_name,
+                    'thumb_path': str(thumb) if thumb else None,
+                    'thumb_size': thumb.stat().st_size if thumb and thumb.exists() else 0,
+                })
             target_msg_id = await self._send_local_file_delete_with_retry(
                 target,
                 downloaded_path,
