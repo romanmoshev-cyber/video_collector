@@ -26,6 +26,7 @@ from watchdog import Heartbeat
 
 log = logging.getLogger('scanner')
 MB = 1024 * 1024
+MAX_TELEGRAM_THUMB_SIZE = 200 * 1024
 ProgressCB = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -190,7 +191,7 @@ def _generate_video_thumbnail(video_path: Path, work_dir: Path, source_id: str, 
         seek_points = [1.0, 3.0, 5.0]
 
     thumb_path = work_dir / f'{source_id}_thumb.jpg'
-    max_size = 20 * 1024
+    max_size = MAX_TELEGRAM_THUMB_SIZE
     last_size = 0
     for seek_sec in seek_points:
         for side in (320, 288, 256, 224, 192, 160, 128, 96):
@@ -221,8 +222,75 @@ def _generate_video_thumbnail(video_path: Path, work_dir: Path, source_id: str, 
                     return thumb_path
 
     if thumb_path.exists() and thumb_path.stat().st_size > 0:
-        log.warning('Generated thumbnail is too large for Telegram custom cover: %s bytes', last_size or thumb_path.stat().st_size)
+        log.warning(
+            'Generated thumbnail is too large for Telegram custom cover: %s bytes (limit %s bytes)',
+            last_size or thumb_path.stat().st_size,
+            max_size,
+        )
     return None
+
+
+def _is_valid_thumbnail(path: Path | None) -> bool:
+    return bool(path and path.exists() and 0 < path.stat().st_size <= MAX_TELEGRAM_THUMB_SIZE)
+
+
+async def _download_message_thumbnail(client: TelegramClient, msg: Message, work_dir: Path, source_id: str) -> Path | None:
+    """Download the original Telegram video cover when it has a static thumbnail."""
+    document = getattr(getattr(msg, 'media', None), 'document', None)
+    thumbs = list(getattr(document, 'thumbs', None) or [])
+    if not thumbs:
+        return None
+
+    static_thumbs = [thumb for thumb in thumbs if thumb.__class__.__name__ != 'VideoSize']
+    if not static_thumbs:
+        return None
+
+    def thumb_score(thumb: Any) -> int:
+        size = getattr(thumb, 'size', None)
+        if size:
+            return int(size)
+        return int(getattr(thumb, 'w', 0) or 0) * int(getattr(thumb, 'h', 0) or 0)
+
+    for thumb in sorted(static_thumbs, key=thumb_score, reverse=True):
+        thumb_path = work_dir / f'{source_id}_original_thumb.jpg'
+        try:
+            downloaded = await client.download_media(msg, file=str(thumb_path), thumb=thumb)
+        except Exception as e:
+            log.debug('Failed to download original thumbnail for msg_id=%s: %s', getattr(msg, 'id', None), e.__class__.__name__)
+            continue
+        if not downloaded:
+            continue
+        downloaded_path = Path(downloaded)
+        if _is_valid_thumbnail(downloaded_path):
+            log.debug('Using original Telegram thumbnail %s (%s bytes)', downloaded_path, downloaded_path.stat().st_size)
+            return downloaded_path
+        if downloaded_path.exists():
+            log.debug('Skipping original thumbnail %s: size=%s bytes', downloaded_path, downloaded_path.stat().st_size)
+            downloaded_path.unlink(missing_ok=True)
+    return None
+
+
+async def _prepare_video_thumbnail(
+    client: TelegramClient,
+    msg: Message | None,
+    video_path: Path,
+    work_dir: Path,
+    source_id: str,
+    duration: Any = None,
+) -> Path | None:
+    if msg is not None:
+        original_thumb = await _download_message_thumbnail(client, msg, work_dir, source_id)
+        if original_thumb:
+            return original_thumb
+
+    generated_thumb = await asyncio.to_thread(
+        _generate_video_thumbnail,
+        video_path,
+        work_dir,
+        source_id,
+        duration,
+    )
+    return generated_thumb if _is_valid_thumbnail(generated_thumb) else None
 
 
 def _sent_message_id(sent: Any) -> int | None:
@@ -546,8 +614,9 @@ class Scanner:
             attributes = _video_attributes_from_values(meta[0], meta[1], meta[2]) if meta else None
             if progress_cb:
                 await progress_cb({'type': 'thumbnail_start', 'chat_id': chat_id, 'chat_name': chat_name, 'msg_id': msg.id})
-            thumb = await asyncio.to_thread(
-                _generate_video_thumbnail,
+            thumb = await _prepare_video_thumbnail(
+                self.client,
+                msg,
                 downloaded_path,
                 work_dir,
                 f'{abs(chat_id)}_{msg.id}',
@@ -806,8 +875,9 @@ class Scanner:
             duration = info.get('duration')
             if progress_cb:
                 await progress_cb({'type': 'thumbnail_start', 'source_id': source_id, 'chat_name': source_name})
-            thumb = await asyncio.to_thread(
-                _generate_video_thumbnail,
+            thumb = await _prepare_video_thumbnail(
+                self.client,
+                None,
                 downloaded_path,
                 work_dir,
                 source_id,
