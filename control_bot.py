@@ -282,7 +282,7 @@ def _format_report(stats: Optional[dict[str, Any]]) -> str:
         name = _short_title(str(item.get('name') or item.get('id') or '—'), limit=24)
         top_lines.append(
             f'  • {escape(name)}: подошло <b>{item.get("matched", 0)}</b>, '
-            f'форвард <b>{item.get("forwarded", 0)}</b>'
+            f'отправлено <b>{item.get("forwarded", 0)}</b>'
         )
 
     lines = [
@@ -291,7 +291,7 @@ def _format_report(stats: Optional[dict[str, Any]]) -> str:
         f'Проверено сообщений: <b>{stats.get("checked", 0)}</b>',
         f'Видео найдено: <b>{stats.get("video_found", stats.get("matched", 0))}</b>',
         f'Подошло видео: <b>{stats.get("matched", 0)}</b>',
-        f'Форварднуто: <b>{stats.get("forwarded", 0)}</b>',
+        f'Отправлено: <b>{stats.get("forwarded", 0)}</b>',
         f'Пропущено как дубль: <b>{stats.get("skipped_already_forwarded", 0)}</b>',
         f'Ошибок: <b>{stats.get("errors", 0)}</b>',
         f'Пустых каналов/групп: <b>{stats.get("empty_chats_count", 0)}</b>',
@@ -356,7 +356,7 @@ def _report_rows_text(period: str, rows: list[dict[str, Any]], page: int) -> str
         lines.append(
             f'{num}. {title}\n'
             f'   видео: <b>{item.get("video_found", 0)}</b> · подошло: <b>{item.get("matched", 0)}</b> · '
-            f'форвард: <b>{item.get("forwarded", 0)}</b> · сообщений: <b>{item.get("checked", 0)}</b>'
+            f'отправлено: <b>{item.get("forwarded", 0)}</b> · сообщений: <b>{item.get("checked", 0)}</b>'
         )
     return '\n'.join(lines)
 
@@ -1000,7 +1000,7 @@ async def run_control_bot(
                 f'Текущий: <b>{escape(str(state["chat_name"]))}</b>\n'
                 f'Проверено: <b>{state["checked"]}</b>\n'
                 f'Подошло: <b>{state["matched"]}</b>\n'
-                f'Форвард: <b>{state["forwarded"]}</b>'
+                f'Отправлено: <b>{state["forwarded"]}</b>'
                 f'{fw_line}'
             )
             await safe_edit_text(progress_msg, text)

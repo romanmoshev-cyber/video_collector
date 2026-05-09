@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from telethon import TelegramClient
@@ -117,6 +119,7 @@ class Scanner:
         heartbeat: Heartbeat,
         excluded_chat_ids: set[int],
         target_bot_username: str,
+        downloads_dir: Path,
         forward_delay_sec: float,
         forward_jitter_sec: float,
         dialog_delay_sec: float,
@@ -128,6 +131,7 @@ class Scanner:
         self.heartbeat = heartbeat
         self.excluded = excluded_chat_ids
         self.target_bot_username = target_bot_username
+        self.downloads_dir = Path(downloads_dir)
         self.forward_delay_sec = max(0.3, forward_delay_sec)
         self.forward_jitter_sec = max(0.0, forward_jitter_sec)
         self.dialog_delay_sec = max(0.0, dialog_delay_sec)
@@ -283,6 +287,27 @@ class Scanner:
                 log.exception('delete_dialog_by_id failed chat_id=%s', chat_id)
                 return False, f'Ошибка: {e.__class__.__name__}'
 
+    async def _download_and_send_video(self, target: Any, msg: Message) -> None:
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f'video_{msg.chat_id}_{msg.id}_', dir=self.downloads_dir) as tmp_dir:
+            downloaded = await self.client.download_media(msg, file=tmp_dir)
+            if not downloaded:
+                raise RuntimeError('download_media returned empty path')
+
+            caption = (msg.message or '').strip() or None
+            if caption and len(caption) > 1024:
+                caption = caption[:1021] + '…'
+
+            await self.client.send_file(
+                target,
+                downloaded,
+                caption=caption,
+                supports_streaming=True,
+            )
+
+    async def _deliver_video(self, target: Any, msg: Message) -> None:
+        await self._download_and_send_video(target, msg)
+
     async def scan(
         self,
         opts: ScanOptions,
@@ -409,7 +434,7 @@ class Scanner:
                         continue
 
                     try:
-                        await self.client.forward_messages(target, msg)
+                        await self._deliver_video(target, msg)
                     except FloodWaitError as e:
                         seconds = int(getattr(e, 'seconds', 1))
                         if progress_cb:
@@ -421,21 +446,21 @@ class Scanner:
                             cancel_event.set()
                             break
                         await asyncio.sleep(seconds + 1)
-                        await self.client.forward_messages(target, msg)
+                        await self._deliver_video(target, msg)
                     except Exception as e:
                         if not _is_connection_error(e):
                             raise
-                        log.warning('Connection error while forwarding chat_id=%s msg_id=%s: %s', chat_id, msg.id, e.__class__.__name__)
-                        if not await self._recover_connection(f'forward chat_id={chat_id} msg_id={msg.id}'):
+                        log.warning('Connection error while delivering chat_id=%s msg_id=%s: %s', chat_id, msg.id, e.__class__.__name__)
+                        if not await self._recover_connection(f'deliver chat_id={chat_id} msg_id={msg.id}'):
                             raise
-                        await self.client.forward_messages(target, msg)
+                        await self._deliver_video(target, msg)
 
                     await self.db.mark_forwarded(chat_id, msg.id, int(time.time()))
                     forwarded_in_chat += 1
                     total_forwarded += 1
 
                     log.info(
-                        'Forwarded: chat_id=%s msg_id=%s duration=%ss w=%s h=%s size=%s',
+                        'Delivered downloaded video: chat_id=%s msg_id=%s duration=%ss w=%s h=%s size=%s',
                         chat_id,
                         msg.id,
                         duration,

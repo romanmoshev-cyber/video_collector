@@ -61,6 +61,7 @@ class Config:
     database_path: Path
     logs_dir: Path
     heartbeat_path: Path
+    downloads_dir: Path
     watchdog_timeout_sec: int
     watchdog_check_interval_sec: int
     progress_edit_interval_sec: float
@@ -90,6 +91,7 @@ def load_config() -> Config:
     database_path = Path(os.getenv('DATABASE_PATH', str(BASE_DIR / 'data' / 'bot.sqlite3'))).resolve()
     logs_dir = Path(os.getenv('LOGS_DIR', str(BASE_DIR / 'logs'))).resolve()
     heartbeat_path = Path(os.getenv('HEARTBEAT_PATH', str(BASE_DIR / 'runtime' / 'heartbeat.json'))).resolve()
+    downloads_dir = Path(os.getenv('DOWNLOADS_DIR', str(BASE_DIR / 'runtime' / 'downloads'))).resolve()
 
     watchdog_timeout_sec = _int('WATCHDOG_TIMEOUT_SEC', 900)
     watchdog_check_interval_sec = _int('WATCHDOG_CHECK_INTERVAL_SEC', 15)
@@ -125,6 +127,7 @@ def load_config() -> Config:
         database_path=database_path,
         logs_dir=logs_dir,
         heartbeat_path=heartbeat_path,
+        downloads_dir=downloads_dir,
         watchdog_timeout_sec=watchdog_timeout_sec,
         watchdog_check_interval_sec=watchdog_check_interval_sec,
         progress_edit_interval_sec=progress_edit_interval_sec,
