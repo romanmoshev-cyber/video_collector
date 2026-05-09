@@ -257,6 +257,16 @@ def _confirm_delete_all_kb():
     return kb.as_markup()
 
 
+def _transfer_line(state: dict[str, Any]) -> str:
+    percent = state.get('percent')
+    total = state.get('total_human')
+    current = state.get('current_human')
+    if percent is None:
+        return ''
+    if current and total:
+        return f'\nПрогресс этапа: <b>{escape(str(percent))}%</b> · <b>{escape(str(current))}</b> / <b>{escape(str(total))}</b>'
+    return f'\nПрогресс этапа: <b>{escape(str(percent))}%</b>'
+
 def _format_duration(seconds: int | float) -> str:
     seconds = int(seconds or 0)
     minutes, sec = divmod(seconds, 60)
@@ -523,8 +533,12 @@ async def run_control_bot(
             event_type = ev.get('type')
             labels = {
                 'download_start': 'ищу видео на странице и скачиваю лучшее качество',
-                'download_done': 'скачано, начинаю загрузку',
+                'download_progress': 'скачиваю на сервер',
+                'download_done': 'скачано, готовлю обложку',
+                'thumbnail_start': 'генерирую обложку',
+                'thumbnail_done': 'обложка готова' if ev.get('thumb_path') else 'обложку создать не удалось',
                 'upload_start': f'загружаю в @{scanner.target_bot_username}',
+                'upload_progress': f'загружаю в @{scanner.target_bot_username}',
                 'upload_done': 'загрузка завершена',
                 'local_delete': 'локальный файл удалён',
                 'floodwait': f'FloodWait {ev.get("seconds", 0)} сек',
@@ -533,6 +547,14 @@ async def run_control_bot(
             state['stage'] = labels.get(event_type, str(event_type or state['stage']))
             if ev.get('chat_name'):
                 state['chat_name'] = ev['chat_name']
+            if event_type in {'download_progress', 'upload_progress'}:
+                state['percent'] = ev.get('percent')
+                state['current_human'] = ev.get('current_human')
+                state['total_human'] = ev.get('total_human')
+            elif event_type in {'download_start', 'download_done', 'thumbnail_start', 'thumbnail_done', 'upload_start', 'upload_done', 'local_delete'}:
+                state.pop('percent', None)
+                state.pop('current_human', None)
+                state.pop('total_human', None)
 
             heartbeat.beat(
                 status='link_progress',
@@ -541,7 +563,7 @@ async def run_control_bot(
                 links_total=state['total'],
             )
 
-            if now - last_edit < progress_edit_interval_sec and event_type not in {'floodwait', 'local_delete'}:
+            if now - last_edit < progress_edit_interval_sec and event_type not in {'floodwait', 'local_delete', 'download_done', 'thumbnail_done', 'upload_done'}:
                 return
             last_edit = now
             await safe_edit_text(
@@ -550,7 +572,8 @@ async def run_control_bot(
                 f'Видео: <b>{state["idx"]} / {state["total"]}</b>\n'
                 f'В ожидании: <b>{len(link_queue)}</b>\n'
                 f'Источник: <b>{escape(str(state["chat_name"]))}</b>\n'
-                f'Статус: <b>{escape(str(state["stage"]))}</b>',
+                f'Этап: <b>{escape(str(state["stage"]))}</b>'
+                f'{_transfer_line(state)}',
             )
 
         await scan_lock.acquire()
@@ -1125,18 +1148,52 @@ async def run_control_bot(
         )
 
         last_edit = 0.0
-        state = {'dialogs_total': 0, 'chat_index': 0, 'checked': 0, 'matched': 0, 'forwarded': 0, 'floodwait': None, 'chat_name': '—'}
+        state = {
+            'dialogs_total': 0,
+            'chat_index': 0,
+            'checked': 0,
+            'matched': 0,
+            'forwarded': 0,
+            'floodwait': None,
+            'chat_name': '—',
+            'stage': 'старт',
+            'msg_id': None,
+        }
 
         async def progress_cb(ev: dict[str, Any]):
             nonlocal last_edit
             now = time.time()
             event_type = ev.get('type')
 
+            stage_labels = {
+                'init': 'готовлю список чатов',
+                'chat_start': 'проверяю чат',
+                'tick': 'читаю сообщения',
+                'download_start': 'скачиваю видео на сервер',
+                'download_progress': 'скачиваю видео на сервер',
+                'download_done': 'скачано, готовлю обложку',
+                'thumbnail_start': 'генерирую обложку',
+                'thumbnail_done': 'обложка готова' if ev.get('thumb_path') else 'обложку создать не удалось',
+                'upload_start': f'загружаю в @{scanner.target_bot_username}',
+                'upload_progress': f'загружаю в @{scanner.target_bot_username}',
+                'upload_done': 'загрузка завершена',
+                'local_delete': 'локальный файл удалён',
+                'forward': 'видео учтено как загруженное',
+                'chat_done': 'чат завершён',
+                'done': 'сканирование завершено',
+                'error': 'ошибка в чате',
+                'floodwait': f'FloodWait {ev.get("seconds", 0)} сек',
+            }
+            state['stage'] = stage_labels.get(event_type, str(event_type or state['stage']))
+            if ev.get('msg_id'):
+                state['msg_id'] = ev.get('msg_id')
+
             if event_type == 'init':
                 state['dialogs_total'] = ev.get('dialogs_total', 0)
             elif event_type == 'chat_start':
                 state['chat_index'] = ev.get('chat_index', 0)
                 state['chat_name'] = ev.get('chat_name', '—')
+                state['msg_id'] = None
             elif event_type in {'tick', 'forward', 'chat_done', 'done'}:
                 state['checked'] = ev.get('checked', state['checked'])
                 state['matched'] = ev.get('matched', state['matched'])
@@ -1145,6 +1202,17 @@ async def run_control_bot(
                     state['chat_name'] = ev['chat_name']
             elif event_type == 'floodwait':
                 state['floodwait'] = ev.get('seconds')
+
+            if ev.get('chat_name'):
+                state['chat_name'] = ev['chat_name']
+            if event_type in {'download_progress', 'upload_progress'}:
+                state['percent'] = ev.get('percent')
+                state['current_human'] = ev.get('current_human')
+                state['total_human'] = ev.get('total_human')
+            elif event_type in {'download_start', 'download_done', 'thumbnail_start', 'thumbnail_done', 'upload_start', 'upload_done', 'local_delete', 'forward', 'chat_done'}:
+                state.pop('percent', None)
+                state.pop('current_human', None)
+                state.pop('total_human', None)
 
             heartbeat.beat(
                 status='scan_progress',
@@ -1156,11 +1224,12 @@ async def run_control_bot(
                 forwarded=state['forwarded'],
             )
 
-            if now - last_edit < progress_edit_interval_sec and event_type not in {'done', 'floodwait'}:
+            if now - last_edit < progress_edit_interval_sec and event_type not in {'done', 'floodwait', 'download_done', 'thumbnail_done', 'upload_done', 'local_delete'}:
                 return
             last_edit = now
 
             fw_line = f'\n⏳ FloodWait: <b>{state["floodwait"]} сек</b>' if state['floodwait'] else ''
+            msg_line = f'\nСообщение: <b>#{state["msg_id"]}</b>' if state.get('msg_id') else ''
             text = (
                 f'{title}\n'
                 f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
@@ -1169,7 +1238,10 @@ async def run_control_bot(
                 f'Текущий: <b>{escape(str(state["chat_name"]))}</b>\n'
                 f'Проверено: <b>{state["checked"]}</b>\n'
                 f'Подошло: <b>{state["matched"]}</b>\n'
-                f'Загружено: <b>{state["forwarded"]}</b>'
+                f'Загружено: <b>{state["forwarded"]}</b>\n'
+                f'Этап: <b>{escape(str(state["stage"]))}</b>'
+                f'{msg_line}'
+                f'{_transfer_line(state)}'
                 f'{fw_line}'
             )
             await safe_edit_text(progress_msg, text)
