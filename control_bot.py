@@ -538,6 +538,35 @@ async def run_control_bot(
     states: dict[int, UserState] = {}
     scan_lock = asyncio.Lock()
     cancel_event = asyncio.Event()
+    background_tasks: set[asyncio.Task[None]] = set()
+
+    def start_background_task(coro, *, name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        background_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task[None]) -> None:
+            background_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                log.error(
+                    'background task %s failed',
+                    done_task.get_name(),
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_on_done)
+
+    async def shutdown_background_tasks() -> None:
+        if not background_tasks:
+            return
+        cancel_event.set()
+        for task in tuple(background_tasks):
+            task.cancel()
+        await asyncio.gather(*tuple(background_tasks), return_exceptions=True)
+
+    dp.shutdown.register(shutdown_background_tasks)
 
     async def get_state(uid: int) -> UserState:
         if uid not in states:
@@ -766,7 +795,7 @@ async def run_control_bot(
                 if scan_lock.locked():
                     scan_lock.release()
 
-        asyncio.create_task(run_link_task(), name=f'video-link-queue-{message.from_user.id}')
+        start_background_task(run_link_task(), name=f'video-link-queue-{message.from_user.id}')
 
     async def render_empty_list(message: Message, st: UserState):
         empty = await scanner.get_saved_empty_chats()
@@ -953,7 +982,7 @@ async def run_control_bot(
             except Exception:
                 log.exception('failed to send menu after scan')
 
-        asyncio.create_task(run_scan_task(), name=f'video-collector-scan-{user_id}')
+        start_background_task(run_scan_task(), name=f'video-collector-scan-{user_id}')
 
     @dp.message(F.text == '/start')
     async def start(m: Message):
