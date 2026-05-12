@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scanner import MB, STALE_DOWNLOAD_DIR_AGE_SEC, ScanOptions, Scanner, _iter_messages_kwargs
+from scanner import MB, STALE_DOWNLOAD_DIR_AGE_SEC, ScanOptions, Scanner, _iter_messages_kwargs, _period_scan_action
 
 
 class IterMessagesKwargsTest(unittest.TestCase):
@@ -33,6 +33,27 @@ class IterMessagesKwargsTest(unittest.TestCase):
         kwargs = _iter_messages_kwargs(ScanOptions(mode='all', chat_ids=None, order='old_to_new'), None, min_id=123)
 
         self.assertEqual(kwargs, {'limit': None, 'min_id': 123, 'reverse': True})
+
+
+class PeriodScanActionTest(unittest.TestCase):
+    def test_new_to_old_stops_after_window(self) -> None:
+        since = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        old_message = datetime(2026, 5, 8, 23, tzinfo=timezone.utc)
+
+        self.assertEqual(_period_scan_action(old_message, since, reverse=False), 'stop')
+
+    def test_old_to_new_skips_until_window(self) -> None:
+        since = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        old_message = datetime(2026, 5, 8, 23, tzinfo=timezone.utc)
+
+        self.assertEqual(_period_scan_action(old_message, since, reverse=True), 'skip')
+
+    def test_message_inside_window_is_kept(self) -> None:
+        since = datetime(2026, 5, 9, tzinfo=timezone.utc)
+        new_message = datetime(2026, 5, 10, tzinfo=timezone.utc)
+
+        self.assertEqual(_period_scan_action(new_message, since, reverse=False), 'keep')
+        self.assertEqual(_period_scan_action(new_message, since, reverse=True), 'keep')
 
 
 class DownloadDirCleanupTest(unittest.TestCase):

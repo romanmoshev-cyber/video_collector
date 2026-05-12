@@ -198,6 +198,16 @@ def _iter_messages_kwargs(opts: ScanOptions, since: Optional[datetime], min_id: 
     return kwargs
 
 
+def _period_scan_action(msg_dt: datetime, since: Optional[datetime], reverse: bool) -> str:
+    if since is None:
+        return 'keep'
+    msg_dt = msg_dt if msg_dt.tzinfo else msg_dt.replace(tzinfo=timezone.utc)
+    msg_dt = msg_dt.astimezone(timezone.utc)
+    if msg_dt >= since:
+        return 'keep'
+    return 'skip' if reverse else 'stop'
+
+
 def _video_attributes_from_values(width: Any, height: Any, duration: Any) -> list[DocumentAttributeVideo] | None:
     try:
         w = int(width or 0)
@@ -1184,13 +1194,12 @@ class Scanner:
                     if msg.id and msg.id > max_id_seen:
                         max_id_seen = msg.id
 
-                    if since and msg.date:
-                        msg_dt = msg.date if msg.date.tzinfo else msg.date.replace(tzinfo=timezone.utc)
-                        msg_dt = msg_dt.astimezone(timezone.utc)
-                        if msg_dt < since and not reverse:
+                    if msg.date:
+                        period_action = _period_scan_action(msg.date, since, opts.order == 'old_to_new')
+                        if period_action == 'stop':
                             hard_stopped_by_date = True
                             break
-                        if msg_dt < since and reverse:
+                        if period_action == 'skip':
                             continue
 
                     meta = _extract_video_meta(msg)
