@@ -1,15 +1,14 @@
 [Unit]
-Description=Video Collector Bot
+Description=Telegram Forward Bot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/video_collector_fixed
-ExecStart=%h/video_collector_fixed/run.sh
+WorkingDirectory=%h/video_collector
+ExecStart=%h/video_collector/venv/bin/python %h/video_collector/main.py
 Restart=always
-RestartSec=5
-TimeoutStopSec=30
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target

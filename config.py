@@ -39,12 +39,6 @@ def _float(name: str, default: float) -> float:
         return default
 
 
-def _bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
-
 
 @dataclass(frozen=True)
 class Config:
@@ -61,8 +55,6 @@ class Config:
     database_path: Path
     logs_dir: Path
     heartbeat_path: Path
-    downloads_dir: Path
-    downloads_reserve_mb: int
     watchdog_timeout_sec: int
     watchdog_check_interval_sec: int
     progress_edit_interval_sec: float
@@ -74,7 +66,6 @@ class Config:
     connection_retries: int
     flood_sleep_threshold: int
     connect_timeout_sec: int
-    dry_run_delete: bool
 
 
 def load_config() -> Config:
@@ -92,9 +83,7 @@ def load_config() -> Config:
     database_path = Path(os.getenv('DATABASE_PATH', str(BASE_DIR / 'data' / 'bot.sqlite3'))).resolve()
     logs_dir = Path(os.getenv('LOGS_DIR', str(BASE_DIR / 'logs'))).resolve()
     heartbeat_path = Path(os.getenv('HEARTBEAT_PATH', str(BASE_DIR / 'runtime' / 'heartbeat.json'))).resolve()
-    downloads_dir = Path(os.getenv('DOWNLOADS_DIR', str(BASE_DIR / 'runtime' / 'downloads'))).resolve()
 
-    downloads_reserve_mb = max(0, _int('DOWNLOADS_RESERVE_MB', 256))
     watchdog_timeout_sec = _int('WATCHDOG_TIMEOUT_SEC', 900)
     watchdog_check_interval_sec = _int('WATCHDOG_CHECK_INTERVAL_SEC', 15)
     progress_edit_interval_sec = _float('PROGRESS_EDIT_INTERVAL_SEC', 3.0)
@@ -106,7 +95,6 @@ def load_config() -> Config:
     connection_retries = _int('CONNECTION_RETRIES', 5)
     flood_sleep_threshold = _int('FLOOD_SLEEP_THRESHOLD', 60)
     connect_timeout_sec = _int('CONNECT_TIMEOUT_SEC', 15)
-    dry_run_delete = _bool('DRY_RUN_DELETE', False)
 
     if not bot_token:
         raise ValueError('BOT_TOKEN is empty')
@@ -129,8 +117,6 @@ def load_config() -> Config:
         database_path=database_path,
         logs_dir=logs_dir,
         heartbeat_path=heartbeat_path,
-        downloads_dir=downloads_dir,
-        downloads_reserve_mb=downloads_reserve_mb,
         watchdog_timeout_sec=watchdog_timeout_sec,
         watchdog_check_interval_sec=watchdog_check_interval_sec,
         progress_edit_interval_sec=progress_edit_interval_sec,
@@ -142,5 +128,4 @@ def load_config() -> Config:
         connection_retries=connection_retries,
         flood_sleep_threshold=flood_sleep_threshold,
         connect_timeout_sec=connect_timeout_sec,
-        dry_run_delete=dry_run_delete,
     )
