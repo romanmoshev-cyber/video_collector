@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, KeyboardButton, Message, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from scanner import ScanOptions, Scanner
@@ -71,25 +71,27 @@ def _main_text(st: UserState, is_scanning: bool) -> str:
         f'Период: <b>{escape(_mode_label(st.mode))}</b> · '
         f'Порядок: <b>{escape(_order_label(st.order))}</b>\n'
         f'Выбрано чатов: <b>{len(st.selected_chats)}</b>\n\n'
-        'Выбери действие кнопками ниже.'
+        'Главное меню теперь находится на нижней клавиатуре Telegram. '
+        'Его можно скрыть обычной стрелкой «назад» на смартфоне.'
     )
 
 
-def _main_kb(is_scanning: bool):
-    kb = InlineKeyboardBuilder()
-    kb.button(text='🔎 Все чаты', callback_data='scan:allchats')
-    kb.button(text='📌 Выбрать', callback_data='pick:open')
-    kb.button(text='⏱ Период', callback_data='mode:open')
-    kb.button(text='🔁 Порядок', callback_data='order:open')
-    kb.button(text='📊 Отчёты', callback_data='reports:menu')
-    kb.button(text='🧹 Пустые', callback_data='empty:list')
-    kb.button(text='🚫 Исключения', callback_data='excluded:list')
-    kb.button(text='📄 Статус', callback_data='status')
+def _main_reply_kb(is_scanning: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text='🔎 Все чаты'), KeyboardButton(text='📌 Выбрать')],
+        [KeyboardButton(text='⏱ Период'), KeyboardButton(text='🔁 Порядок')],
+        [KeyboardButton(text='📊 Отчёты'), KeyboardButton(text='📄 Статус')],
+        [KeyboardButton(text='🧹 Пустые'), KeyboardButton(text='🚫 Исключения')],
+    ]
     if is_scanning:
-        kb.button(text='⛔ Стоп', callback_data='scan:stop')
-        kb.adjust(2, 2, 2, 2, 1)
-    else:
-        kb.adjust(2, 2, 2, 2)
+        rows.append([KeyboardButton(text='⛔ Стоп')])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=False)
+
+
+def _scan_progress_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text='⛔ Стоп', callback_data='scan:stop')
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -144,7 +146,7 @@ def _pick_text(dialogs: list[dict[str, Any]], selected: set[int], page: int, per
     total = len(dialogs)
     pages = max(1, (total + per_page - 1) // per_page)
     return (
-        '📌 <b>Выбор чатов/каналов</b>\n'
+        '📌 <b>Выбор чатов</b>\n'
         f'Страница: <b>{page + 1} / {pages}</b> · всего: <b>{total}</b>\n'
         f'Выбрано: <b>{len(selected)}</b>\n\n'
         'Список сделан в 2 колонки. Можно быстро выбрать или снять всю текущую страницу.'
@@ -187,8 +189,7 @@ def _pick_kb(dialogs: list[dict[str, Any]], selected: set[int], page: int, per_p
 
 
 def _empty_item_text(item: dict[str, Any], page: int, total: int) -> str:
-    link_line = f"<a href='{escape(item['link'])}'>Открыть канал/группу</a>" if item.get('link') else 'Публичной ссылки нет.'
-    peer_type = 'канал' if item.get('is_channel') else 'группа'
+    peer_type = item.get('type') or ('личный чат' if item.get('is_user') else 'канал' if item.get('is_channel') else 'группа')
     return (
         f'🧹 <b>Без подходящих видео</b>\n'
         f'#{page + 1} из {total}\n\n'
@@ -198,15 +199,12 @@ def _empty_item_text(item: dict[str, Any], page: int, total: int) -> str:
         f'<b>Проверено сообщений:</b> {item.get("checked", 0)}\n'
         f'<b>Подошло:</b> {item.get("matched", 0)}\n'
         f'<b>Видео найдено:</b> {item.get("video_found", 0)}\n'
-        f'<b>Форварднуто:</b> {item.get("forwarded", 0)}\n'
-        f'{link_line}'
+        f'<b>Форварднуто:</b> {item.get("forwarded", 0)}'
     )
 
 
 def _empty_item_kb(item: dict[str, Any], page: int, total: int):
     kb = InlineKeyboardBuilder()
-    if item.get('link'):
-        kb.button(text='🔗 Открыть', url=item['link'])
     kb.button(text='🗑 Удалить/выйти', callback_data=f'empty:delete:confirm:{item["id"]}')
     kb.button(text='🚫 Исключить', callback_data=f'empty:exclude:{item["id"]}')
     kb.button(text='❌ Убрать из списка', callback_data=f'empty:forget:{item["id"]}')
@@ -219,8 +217,6 @@ def _empty_item_kb(item: dict[str, Any], page: int, total: int):
 
     kb.button(text='⬅️ В меню', callback_data='back:main')
     sizes = []
-    if item.get('link'):
-        sizes.append(1)
     sizes.extend([2, 2])
     nav_count = int(page > 0) + int(page + 1 < total)
     if nav_count:
@@ -294,7 +290,7 @@ def _format_report(stats: Optional[dict[str, Any]]) -> str:
         f'Отправлено: <b>{stats.get("forwarded", 0)}</b>',
         f'Пропущено как дубль: <b>{stats.get("skipped_already_forwarded", 0)}</b>',
         f'Ошибок: <b>{stats.get("errors", 0)}</b>',
-        f'Пустых каналов/групп: <b>{stats.get("empty_chats_count", 0)}</b>',
+        f'Пустых чатов: <b>{stats.get("empty_chats_count", 0)}</b>',
         f'Список пустых обновлён: <b>{"да" if stats.get("empty_chats_updated") else "нет"}</b>',
         f'Время: <b>{_format_duration(stats.get("elapsed_sec", 0))}</b>',
         'Статус: ⛔ остановлено' if stats.get('cancelled') else 'Статус: ✅ завершено',
@@ -325,7 +321,7 @@ def _reports_menu_text() -> str:
     return (
         '📊 <b>Отчёты</b>\n\n'
         'Здесь есть последний общий отчёт и отдельные списки по периодам: всё, месяц, неделя, сутки. '
-        'В строках отчёта название кликабельное, а ниже есть кнопки удаления и исключения.'
+        'В строках отчёта показаны названия чатов, а ниже есть кнопки удаления и исключения.'
     )
 
 
@@ -349,10 +345,7 @@ def _report_rows_text(period: str, rows: list[dict[str, Any]], page: int) -> str
         return '\n'.join(lines)
     for num, item in enumerate(chunk, start=start + 1):
         name = escape(str(item.get('name') or item.get('id') or '—'))
-        if item.get('link'):
-            title = f'<a href="{escape(item["link"])}">{name}</a>'
-        else:
-            title = name
+        title = name
         lines.append(
             f'{num}. {title}\n'
             f'   видео: <b>{item.get("video_found", 0)}</b> · подошло: <b>{item.get("matched", 0)}</b> · '
@@ -398,10 +391,7 @@ def _excluded_text(items: list[dict[str, Any]], page: int) -> str:
         return '\n'.join(lines)
     for num, item in enumerate(chunk, start=start + 1):
         name = escape(str(item.get('name') or item.get('id') or '—'))
-        if item.get('link'):
-            title = f'<a href="{escape(item["link"])}">{name}</a>'
-        else:
-            title = name
+        title = name
         lines.append(f'{num}. {title} · <code>{item.get("id")}</code>')
     return '\n'.join(lines)
 
@@ -464,7 +454,7 @@ async def run_control_bot(
         st.last_stats['empty_chats'] = empty
         st.last_stats['empty_chats_count'] = len(empty)
         if not empty:
-            await safe_edit_text(message, 'Список пустых каналов/групп пока пуст.', reply_markup=_main_kb(scan_lock.locked()))
+            await safe_edit_text(message, 'Список пустых чатов пока пуст.')
             return
         st.last_empty_page = max(0, min(st.last_empty_page, len(empty) - 1))
         item = empty[st.last_empty_page]
@@ -491,20 +481,51 @@ async def run_control_bot(
             return
         st = await get_state(m.from_user.id)
         heartbeat.beat(status='menu_open', user_id=m.from_user.id)
-        await m.answer(_main_text(st, scan_lock.locked()), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+        await m.answer(_main_text(st, scan_lock.locked()), reply_markup=_main_reply_kb(is_scanning=scan_lock.locked()))
 
     @dp.message(F.text == '/help')
     async def help_command(m: Message):
         if not _is_allowed(m.from_user.id, allowed_users):
             return
-        await m.answer(_help_text(), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+        await m.answer(_help_text(), reply_markup=_main_reply_kb(is_scanning=scan_lock.locked()))
 
     @dp.message(F.text == '/status')
     async def status_command(m: Message):
         if not _is_allowed(m.from_user.id, allowed_users):
             return
         st = await get_state(m.from_user.id)
-        await m.answer(_status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
+        await m.answer(_status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_reply_kb(scan_lock.locked()))
+
+    @dp.message(F.text.in_({'📌 Выбрать', '⏱ Период', '🔁 Порядок', '📊 Отчёты', '🧹 Пустые', '🚫 Исключения', '📄 Статус'}))
+    async def main_keyboard_buttons(m: Message):
+        if not _is_allowed(m.from_user.id, allowed_users):
+            return
+        st = await get_state(m.from_user.id)
+        text = m.text
+        if text == '📌 Выбрать':
+            if not st.dialogs_cache:
+                await m.answer('Гружу список чатов…', reply_markup=_main_reply_kb(scan_lock.locked()))
+                st.dialogs_cache = await scanner.list_dialogs()
+                st.dialogs_cache.sort(key=lambda x: (x.get('name') or '').lower())
+            st.page = 0
+            await m.answer(
+                _pick_text(st.dialogs_cache, st.selected_chats, st.page),
+                reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page),
+            )
+        elif text == '⏱ Период':
+            await m.answer('⏱ <b>Период сканирования</b>\nВыбери, какие сообщения проверять:', reply_markup=_mode_kb(st.mode))
+        elif text == '🔁 Порядок':
+            await m.answer('🔁 <b>Порядок сканирования</b>\nС какой стороны читать историю:', reply_markup=_order_kb(st.order))
+        elif text == '📊 Отчёты':
+            await m.answer(_reports_menu_text(), reply_markup=_reports_menu_kb())
+        elif text == '🧹 Пустые':
+            msg = await m.answer('Открываю список пустых чатов…')
+            await render_empty_list(msg, st)
+        elif text == '🚫 Исключения':
+            msg = await m.answer('Открываю исключения…')
+            await render_excluded(msg, st, st.excluded_page)
+        elif text == '📄 Статус':
+            await m.answer(_status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_reply_kb(scan_lock.locked()))
 
     @dp.callback_query(F.data == 'back:main')
     async def back_main(c: CallbackQuery):
@@ -512,7 +533,8 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         heartbeat.beat(status='back_main', user_id=c.from_user.id)
-        await safe_edit_text(c.message, _main_text(st, scan_lock.locked()), reply_markup=_main_kb(is_scanning=scan_lock.locked()))
+        await safe_edit_text(c.message, '🏠 Главное меню открыто на нижней клавиатуре Telegram.')
+        await c.message.answer(_main_text(st, scan_lock.locked()), reply_markup=_main_reply_kb(is_scanning=scan_lock.locked()))
         await c.answer()
 
     @dp.callback_query(F.data == 'mode:open')
@@ -659,7 +681,7 @@ async def run_control_bot(
             return
         st = await get_state(c.from_user.id)
         await c.answer()
-        await safe_edit_text(c.message, _status_text(st, heartbeat, scan_lock.locked()), reply_markup=_main_kb(scan_lock.locked()))
+        await safe_edit_text(c.message, _status_text(st, heartbeat, scan_lock.locked()))
 
     @dp.callback_query(F.data == 'reports:menu')
     async def reports_menu(c: CallbackQuery):
@@ -821,7 +843,7 @@ async def run_control_bot(
             if st.last_stats['empty_chats']:
                 await render_empty_list(c.message, st)
             else:
-                await safe_edit_text(c.message, f'✅ {escape(info)}', reply_markup=_main_kb(scan_lock.locked()))
+                await safe_edit_text(c.message, f'✅ {escape(info)}', reply_markup=None)
         else:
             await c.message.answer(f'Не удалось удалить: {escape(info)}')
         await c.answer('Готово' if ok else 'Ошибка')
@@ -837,7 +859,7 @@ async def run_control_bot(
         text = (
             f'⚠️ <b>Подтверди массовое удаление/выход</b>\n\n'
             f'Будет обработано чатов: <b>{len(empty)}</b>.\n'
-            f'Это удалит диалоги из аккаунта и выйдет из каналов/групп, если Telegram это разрешает.'
+            f'Это удалит диалоги из аккаунта и выйдет из чатов, если Telegram это разрешает.'
         )
         await safe_edit_text(c.message, text, reply_markup=_confirm_delete_all_kb())
         await c.answer()
@@ -881,7 +903,7 @@ async def run_control_bot(
         await safe_edit_text(
             progress_msg,
             f'✅ Массовое удаление/выход завершено.\nУдалено: <b>{deleted}</b>\nОсталось в списке: <b>{len(remaining)}</b>{fail_text}',
-            reply_markup=_main_kb(scan_lock.locked()),
+            reply_markup=None,
         )
 
     @dp.callback_query(F.data == 'excluded:list')
@@ -911,27 +933,9 @@ async def run_control_bot(
         await render_excluded(c.message, st, int(page_raw))
         await c.answer('Чат возвращён в проверки')
 
-    @dp.callback_query(F.data == 'scan:stop')
-    async def scan_stop(c: CallbackQuery):
-        if not _is_allowed(c.from_user.id, allowed_users):
-            return
-        if not scan_lock.locked():
-            await c.answer('Скан сейчас не идёт.', show_alert=False)
-            return
-        cancel_event.set()
-        heartbeat.beat(status='scan_stop_requested', user_id=c.from_user.id)
-        await c.answer('Останавливаю…', show_alert=False)
-
-    @dp.callback_query(F.data.startswith('scan:'))
-    async def scan_handler(c: CallbackQuery):
-        if not _is_allowed(c.from_user.id, allowed_users):
-            return
-        st = await get_state(c.from_user.id)
-        kind = c.data.split(':')[-1]
-        if kind == 'stop':
-            return
+    async def start_scan(message: Message, user_id: int, st: UserState, kind: str, notify):
         if scan_lock.locked():
-            await c.answer('Скан уже идёт. Нажми ⛔ Стоп.', show_alert=True)
+            await notify('Скан уже идёт. Нажми ⛔ Стоп.', True)
             return
 
         if kind == 'allchats':
@@ -939,20 +943,21 @@ async def run_control_bot(
             title = '🔎 Поиск во всех'
         elif kind == 'selected':
             if not st.selected_chats:
-                await c.answer('Сначала выбери чаты.', show_alert=True)
+                await notify('Сначала выбери чаты.', True)
                 return
             opts = ScanOptions(mode=st.mode, chat_ids=set(st.selected_chats), order=st.order)
             title = '📌 Поиск по выбранным'
         else:
-            await c.answer('Неизвестная команда', show_alert=True)
+            await notify('Неизвестная команда', True)
             return
 
         cancel_event.clear()
-        await c.answer('Запускаю…')
+        await notify('Запускаю…', False)
 
-        progress_msg = await c.message.answer(
+        progress_msg = await message.answer(
             f'{title}\nПериод: <b>{escape(_mode_label(st.mode))}</b>\nПорядок: <b>{escape(_order_label(st.order))}</b>\nСтатус: старт…',
             disable_web_page_preview=True,
+            reply_markup=_scan_progress_kb(),
         )
 
         last_edit = 0.0
@@ -1003,10 +1008,9 @@ async def run_control_bot(
                 f'Отправлено: <b>{state["forwarded"]}</b>'
                 f'{fw_line}'
             )
-            await safe_edit_text(progress_msg, text)
+            await safe_edit_text(progress_msg, text, reply_markup=_scan_progress_kb())
 
-        origin_message = c.message
-        user_id = c.from_user.id
+        origin_message = message
 
         await scan_lock.acquire()
 
@@ -1049,10 +1053,59 @@ async def run_control_bot(
             tail = '\n⛔ <b>Остановлено</b>' if stats.get('cancelled') else '\n✅ <b>Завершено</b>'
             await safe_edit_text(progress_msg, _format_report(stats) + tail)
             try:
-                await origin_message.answer(_main_text(st, False), reply_markup=_main_kb(is_scanning=False))
+                await origin_message.answer(_main_text(st, False), reply_markup=_main_reply_kb(is_scanning=False))
             except Exception:
                 log.exception('failed to send menu after scan')
 
         asyncio.create_task(run_scan_task(), name=f'video-collector-scan-{user_id}')
+
+
+    @dp.callback_query(F.data == 'scan:stop')
+    async def scan_stop(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        if not scan_lock.locked():
+            await c.answer('Скан сейчас не идёт.', show_alert=False)
+            return
+        cancel_event.set()
+        heartbeat.beat(status='scan_stop_requested', user_id=c.from_user.id)
+        await c.answer('Останавливаю…', show_alert=False)
+
+    @dp.message(F.text == '⛔ Стоп')
+    async def scan_stop_message(m: Message):
+        if not _is_allowed(m.from_user.id, allowed_users):
+            return
+        if not scan_lock.locked():
+            await m.answer('Скан сейчас не идёт.', reply_markup=_main_reply_kb(False))
+            return
+        cancel_event.set()
+        heartbeat.beat(status='scan_stop_requested', user_id=m.from_user.id)
+        await m.answer('⛔ Останавливаю сканирование…', reply_markup=_main_reply_kb(True))
+
+    @dp.callback_query(F.data.startswith('scan:'))
+    async def scan_handler(c: CallbackQuery):
+        if not _is_allowed(c.from_user.id, allowed_users):
+            return
+        kind = c.data.split(':')[-1]
+        if kind == 'stop':
+            return
+        st = await get_state(c.from_user.id)
+
+        async def notify(text: str, show_alert: bool = False):
+            await c.answer(text, show_alert=show_alert)
+
+        await start_scan(c.message, c.from_user.id, st, kind, notify)
+
+    @dp.message(F.text.in_(('🔎 Все чаты', '🚀 Старт выбранных')))
+    async def scan_message_handler(m: Message):
+        if not _is_allowed(m.from_user.id, allowed_users):
+            return
+        st = await get_state(m.from_user.id)
+        kind = 'allchats' if m.text == '🔎 Все чаты' else 'selected'
+
+        async def notify(text: str, show_alert: bool = False):
+            await m.answer(text, reply_markup=_main_reply_kb(scan_lock.locked()))
+
+        await start_scan(m, m.from_user.id, st, kind, notify)
 
     await dp.start_polling(bot, polling_timeout=10, handle_as_tasks=True, close_bot_session=True)
