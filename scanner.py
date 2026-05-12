@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, Optional
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.custom.dialog import Dialog
-from telethon.tl.types import Message
+from telethon.tl.types import Message, MessageMediaDocument
 
 from db import DB
 from watchdog import Heartbeat
@@ -39,6 +39,7 @@ def _since_dt(mode: str) -> Optional[datetime]:
 
 
 SKIPPED_DIALOG_NAMES = {'избранное', 'saved messages'}
+SKIPPED_DIALOG_NAME_PARTS = {'vertical'}
 
 
 def _dialog_name(dialog: Dialog) -> str:
@@ -57,7 +58,10 @@ def _should_scan_dialog(dialog: Dialog, target_bot_username: str = '') -> bool:
     username = (getattr(dialog.entity, 'username', None) or '').casefold().lstrip('@')
     if target_bot_username and username == target_bot_username.casefold().lstrip('@'):
         return False
-    return _dialog_name(dialog).casefold() not in SKIPPED_DIALOG_NAMES
+    name = _dialog_name(dialog).casefold()
+    if name in SKIPPED_DIALOG_NAMES:
+        return False
+    return not any(part in name for part in SKIPPED_DIALOG_NAME_PARTS)
 
 
 EXCLUDED_CHATS_KEY = 'excluded_chats:manual'
@@ -92,6 +96,17 @@ class Scanner:
         self.dialog_delay_sec = max(0.0, dialog_delay_sec)
         self.max_flood_wait_sec = max_flood_wait_sec
 
+    @staticmethod
+    def _is_video_message(msg: Message) -> bool:
+        if getattr(msg, 'video', None):
+            return True
+        media = getattr(msg, 'media', None)
+        document = getattr(media, 'document', None) if isinstance(media, MessageMediaDocument) else getattr(msg, 'document', None)
+        if not document:
+            return False
+        mime_type = (getattr(document, 'mime_type', '') or '').casefold()
+        return mime_type.startswith('video/')
+
     async def _ensure_connected(self) -> None:
         if self.client.is_connected():
             return
@@ -124,9 +139,22 @@ class Scanner:
                 raise
             return await func()
 
-    async def _collect_dialogs(self, opts: ScanOptions | None = None) -> list[Dialog]:
-        for item in await self.db.kv_get_json(EXCLUDED_CHATS_KEY, []):
+    async def _load_manual_excluded(self) -> list[dict[str, Any]]:
+        items = await self.db.kv_get_json(EXCLUDED_CHATS_KEY, [])
+        for item in items:
             self.excluded.add(int(item.get('id', 0)))
+        return items
+
+    async def exclude_chat(self, chat_id: int, name: str = '') -> None:
+        items = await self._load_manual_excluded()
+        chat_id = int(chat_id)
+        self.excluded.add(chat_id)
+        saved = [item for item in items if int(item.get('id', 0)) != chat_id]
+        saved.append({'id': chat_id, 'name': name or str(chat_id), 'excluded_at': int(time.time())})
+        await self.db.kv_set_json(EXCLUDED_CHATS_KEY, saved)
+
+    async def _collect_dialogs(self, opts: ScanOptions | None = None) -> list[Dialog]:
+        await self._load_manual_excluded()
         dialogs: list[Dialog] = []
         async for dialog in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
             if int(dialog.id) in self.excluded:
@@ -153,6 +181,61 @@ class Scanner:
                 'username': username,
             })
         return items
+
+
+    async def list_dialog_video_stats(
+        self,
+        mode: str = 'all',
+        chat_ids: Optional[set[int]] = None,
+        progress_cb: Optional[ProgressCB] = None,
+    ) -> list[dict[str, Any]]:
+        opts = ScanOptions(mode=mode, order='new_to_old', chat_ids=chat_ids)
+        dialogs = await self._run_with_connection_recovery('stats_collect_dialogs', lambda: self._collect_dialogs(opts))
+        since = _since_dt(mode)
+        result: list[dict[str, Any]] = []
+
+        if progress_cb:
+            await progress_cb({'type': 'stats_init', 'dialogs_total': len(dialogs), 'mode': mode})
+
+        for idx, dialog in enumerate(dialogs, start=1):
+            chat_id = int(dialog.id)
+            dialog_name = dialog.name or str(chat_id)
+            videos_total = 0
+            videos_matched = 0
+
+            if progress_cb:
+                await progress_cb({'type': 'stats_chat_start', 'chat_index': idx, 'dialogs_total': len(dialogs), 'chat_id': chat_id, 'chat_name': dialog_name})
+
+            async for msg in self.client.iter_messages(chat_id, limit=None):
+                if not isinstance(msg, Message) or not msg.id:
+                    continue
+                if since and msg.date:
+                    msg_dt = msg.date if msg.date.tzinfo else msg.date.replace(tzinfo=timezone.utc)
+                    msg_dt = msg_dt.astimezone(timezone.utc)
+                    if msg_dt < since:
+                        break
+                if not self._is_video_message(msg):
+                    continue
+
+                videos_total += 1
+                if not await self.db.was_forwarded(chat_id, msg.id):
+                    videos_matched += 1
+
+            item = {
+                'id': chat_id,
+                'name': dialog_name,
+                'type': _dialog_type_label(dialog),
+                'is_group': bool(dialog.is_group),
+                'is_channel': bool(dialog.is_channel),
+                'videos_total': videos_total,
+                'videos_matched': videos_matched,
+            }
+            result.append(item)
+
+            if progress_cb:
+                await progress_cb({'type': 'stats_chat_done', 'chat_index': idx, 'dialogs_total': len(dialogs), **item})
+
+        return result
 
     async def scan(
         self,
@@ -219,6 +302,9 @@ class Scanner:
                             break
                         if msg_dt < since and reverse:
                             continue
+
+                    if not self._is_video_message(msg):
+                        continue
 
                     if await self.db.was_forwarded(chat_id, msg.id):
                         total_skipped += 1
