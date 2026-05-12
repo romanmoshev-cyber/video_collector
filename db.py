@@ -18,7 +18,6 @@ class DB:
         self.conn.row_factory = aiosqlite.Row
         await self.conn.execute('PRAGMA journal_mode=WAL')
         await self.conn.execute('PRAGMA synchronous=NORMAL')
-        await self.conn.execute('PRAGMA foreign_keys=ON')
         await self.conn.executescript(
             '''
             CREATE TABLE IF NOT EXISTS forwarded_messages (
@@ -37,19 +36,6 @@ class DB:
             CREATE TABLE IF NOT EXISTS kv_store (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS scan_chat_stats (
-                period TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                chat_name TEXT NOT NULL,
-                chat_link TEXT,
-                checked INTEGER NOT NULL DEFAULT 0,
-                video_found INTEGER NOT NULL DEFAULT 0,
-                matched INTEGER NOT NULL DEFAULT 0,
-                forwarded INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (period, chat_id)
             );
             '''
         )
@@ -119,66 +105,3 @@ class DB:
         if not row:
             return default
         return json.loads(row['value'])
-
-    async def upsert_chat_stats(self, period: str, rows: list[dict[str, Any]], updated_at: int) -> None:
-        if not rows:
-            return
-        assert self.conn is not None
-        await self.conn.executemany(
-            """
-            INSERT INTO scan_chat_stats(
-                period, chat_id, chat_name, chat_link, checked, video_found, matched, forwarded, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(period, chat_id) DO UPDATE SET
-                chat_name = excluded.chat_name,
-                chat_link = excluded.chat_link,
-                checked = excluded.checked,
-                video_found = excluded.video_found,
-                matched = excluded.matched,
-                forwarded = excluded.forwarded,
-                updated_at = excluded.updated_at
-            """,
-            [
-                (
-                    period,
-                    int(row['id']),
-                    str(row.get('name') or row['id']),
-                    row.get('link'),
-                    int(row.get('checked', 0) or 0),
-                    int(row.get('video_found', 0) or 0),
-                    int(row.get('matched', 0) or 0),
-                    int(row.get('forwarded', 0) or 0),
-                    updated_at,
-                )
-                for row in rows
-            ],
-        )
-        await self.conn.commit()
-
-    async def get_chat_stats(self, period: str, limit: int = 500) -> list[dict[str, Any]]:
-        assert self.conn is not None
-        async with self.conn.execute(
-            """
-            SELECT chat_id, chat_name, chat_link, checked, video_found, matched, forwarded, updated_at
-            FROM scan_chat_stats
-            WHERE period = ?
-            ORDER BY matched DESC, forwarded DESC, video_found DESC, checked DESC, chat_name COLLATE NOCASE ASC
-            LIMIT ?
-            """,
-            (period, limit),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [
-            {
-                'id': int(row['chat_id']),
-                'name': row['chat_name'],
-                'link': row['chat_link'],
-                'checked': int(row['checked']),
-                'video_found': int(row['video_found']),
-                'matched': int(row['matched']),
-                'forwarded': int(row['forwarded']),
-                'updated_at': int(row['updated_at']),
-            }
-            for row in rows
-        ]

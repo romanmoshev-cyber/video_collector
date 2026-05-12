@@ -102,13 +102,10 @@ async def async_main() -> None:
             heartbeat=heartbeat,
             excluded_chat_ids=cfg.excluded_chat_ids,
             target_bot_username=cfg.target_bot_username,
-            downloads_dir=cfg.downloads_dir,
-            downloads_reserve_mb=cfg.downloads_reserve_mb,
             forward_delay_sec=cfg.forward_delay_sec,
             forward_jitter_sec=cfg.forward_jitter_sec,
             dialog_delay_sec=cfg.dialog_delay_sec,
             max_flood_wait_sec=cfg.max_flood_wait_sec,
-            dry_run_delete=cfg.dry_run_delete,
         )
 
         hb_task = asyncio.create_task(heartbeat_loop(heartbeat, interval_sec=10))

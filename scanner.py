@@ -3,30 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import shutil
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.custom.dialog import Dialog
-from telethon.tl.types import DocumentAttributeVideo, Message
+from telethon.tl.types import Message
 
 from db import DB
 from watchdog import Heartbeat
 
 log = logging.getLogger('scanner')
-MB = 1024 * 1024
-STALE_DOWNLOAD_MAX_AGE_SEC = 6 * 60 * 60
 ProgressCB = Callable[[dict[str, Any]], Awaitable[None]]
-
-
-class InsufficientDownloadSpaceError(RuntimeError):
-    pass
 
 
 @dataclass
@@ -47,47 +38,7 @@ def _since_dt(mode: str) -> Optional[datetime]:
     return None
 
 
-def _extract_video_meta(msg: Message) -> tuple[int, int, int, int] | None:
-    if not msg or not msg.media or not getattr(msg.media, 'document', None):
-        return None
-    doc = msg.media.document
-    if not getattr(doc, 'attributes', None):
-        return None
-
-    w = h = duration = None
-    for attr in doc.attributes:
-        if isinstance(attr, DocumentAttributeVideo):
-            w = getattr(attr, 'w', None)
-            h = getattr(attr, 'h', None)
-            duration = getattr(attr, 'duration', None)
-            break
-
-    if w is None or h is None or duration is None:
-        return None
-
-    size = int(getattr(doc, 'size', 0) or 0)
-    return int(w), int(h), int(duration), size
-
-
-def _reject_reason(w: int, h: int, duration: int, size: int) -> str | None:
-    if h <= w:
-        return 'not_vertical'
-    if duration < 180:
-        return 'too_short'
-    if w < 900:
-        return 'too_narrow'
-    min_size = (duration / 60.0) * (10 * MB)
-    if size < min_size:
-        return 'too_small'
-    return None
-
-
-def _matches_rules(w: int, h: int, duration: int, size: int) -> bool:
-    return _reject_reason(w, h, duration, size) is None
-
-
-SKIPPED_DIALOG_NAMES = {'избранное', 'saved messages', 'подборки 18+'}
-SKIPPED_DIALOG_PREFIXES = ('vertical',)
+SKIPPED_DIALOG_NAMES = {'избранное', 'saved messages'}
 
 
 def _dialog_name(dialog: Dialog) -> str:
@@ -95,32 +46,20 @@ def _dialog_name(dialog: Dialog) -> str:
 
 
 def _dialog_type_label(dialog: Dialog) -> str:
-    if dialog.is_user:
-        return 'личный чат'
-    if dialog.is_group:
-        return 'группа'
-    if dialog.is_channel:
-        return 'канал'
-    return 'чат'
+    return 'группа' if dialog.is_group else 'канал' if dialog.is_channel else 'чат'
 
 
 def _should_scan_dialog(dialog: Dialog, target_bot_username: str = '') -> bool:
-    name = _dialog_name(dialog)
-    normalized_name = name.casefold()
-
+    if not (dialog.is_group or dialog.is_channel):
+        return False
     if getattr(dialog.entity, 'self', False):
         return False
     username = (getattr(dialog.entity, 'username', None) or '').casefold().lstrip('@')
     if target_bot_username and username == target_bot_username.casefold().lstrip('@'):
         return False
-    if normalized_name in SKIPPED_DIALOG_NAMES:
-        return False
-    if normalized_name.startswith(SKIPPED_DIALOG_PREFIXES):
-        return False
-    return bool(dialog.is_user or dialog.is_group or dialog.is_channel)
+    return _dialog_name(dialog).casefold() not in SKIPPED_DIALOG_NAMES
 
 
-EMPTY_CHATS_KEY = 'empty_chats:last_full_scan'
 EXCLUDED_CHATS_KEY = 'excluded_chats:manual'
 CONNECTION_RECOVERY_ATTEMPTS = 3
 CONNECTION_RECOVERY_BASE_DELAY_SEC = 2.0
@@ -138,27 +77,20 @@ class Scanner:
         heartbeat: Heartbeat,
         excluded_chat_ids: set[int],
         target_bot_username: str,
-        downloads_dir: Path,
-        downloads_reserve_mb: int,
         forward_delay_sec: float,
         forward_jitter_sec: float,
         dialog_delay_sec: float,
         max_flood_wait_sec: int,
-        dry_run_delete: bool,
     ):
         self.client = client
         self.db = db
         self.heartbeat = heartbeat
-        self.excluded = excluded_chat_ids
+        self.excluded = set(excluded_chat_ids)
         self.target_bot_username = target_bot_username
-        self.downloads_dir = Path(downloads_dir)
-        self.downloads_reserve_bytes = max(0, downloads_reserve_mb) * MB
-        self.forward_delay_sec = max(0.3, forward_delay_sec)
+        self.forward_delay_sec = max(0.1, forward_delay_sec)
         self.forward_jitter_sec = max(0.0, forward_jitter_sec)
         self.dialog_delay_sec = max(0.0, dialog_delay_sec)
         self.max_flood_wait_sec = max_flood_wait_sec
-        self.dry_run_delete = dry_run_delete
-        self._delete_lock = asyncio.Lock()
 
     async def _ensure_connected(self) -> None:
         if self.client.is_connected():
@@ -175,13 +107,7 @@ class Scanner:
                 return True
             except Exception as e:
                 delay = CONNECTION_RECOVERY_BASE_DELAY_SEC * attempt
-                log.warning(
-                    'Telethon reconnect failed after %s (attempt %s/%s): %s',
-                    context,
-                    attempt,
-                    CONNECTION_RECOVERY_ATTEMPTS,
-                    e.__class__.__name__,
-                )
+                log.warning('Telethon reconnect failed after %s (attempt %s/%s): %s', context, attempt, CONNECTION_RECOVERY_ATTEMPTS, e.__class__.__name__)
                 if attempt < CONNECTION_RECOVERY_ATTEMPTS:
                     await asyncio.sleep(delay)
         return False
@@ -202,165 +128,31 @@ class Scanner:
         for item in await self.db.kv_get_json(EXCLUDED_CHATS_KEY, []):
             self.excluded.add(int(item.get('id', 0)))
         dialogs: list[Dialog] = []
-        async for d in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
-            if d.id in self.excluded:
+        async for dialog in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
+            if int(dialog.id) in self.excluded:
                 continue
-            if not _should_scan_dialog(d, self.target_bot_username):
+            if not _should_scan_dialog(dialog, self.target_bot_username):
                 continue
-            if opts and opts.chat_ids is not None and d.id not in opts.chat_ids:
+            if opts and opts.chat_ids is not None and int(dialog.id) not in opts.chat_ids:
                 continue
-            dialogs.append(d)
+            dialogs.append(dialog)
         return dialogs
 
     async def list_dialogs(self) -> list[dict[str, Any]]:
         scan_dialogs = await self._run_with_connection_recovery('list_dialogs', lambda: self._collect_dialogs())
-        dialogs: list[dict[str, Any]] = []
-        for d in scan_dialogs:
-            link = None
-            username = getattr(d.entity, 'username', None)
-            if username:
-                link = f'https://t.me/{username}'
-            dialogs.append(
-                {
-                    'id': int(d.id),
-                    'name': d.name or str(d.id),
-                    'is_user': bool(d.is_user),
-                    'is_group': bool(d.is_group),
-                    'is_channel': bool(d.is_channel),
-                    'type': _dialog_type_label(d),
-                    'link': link,
-                    'username': username,
-                }
-            )
-        return dialogs
-
-    async def get_saved_empty_chats(self) -> list[dict[str, Any]]:
-        return await self.db.kv_get_json(EMPTY_CHATS_KEY, [])
-
-    async def save_empty_chats(self, empty_chats: list[dict[str, Any]]) -> None:
-        await self.db.kv_set_json(EMPTY_CHATS_KEY, empty_chats)
-
-    async def update_empty_chats(self, empty_chats: list[dict[str, Any]], non_empty_chat_ids: set[int], replace: bool) -> None:
-        if replace:
-            await self.save_empty_chats(empty_chats)
-            return
-        saved = await self.get_saved_empty_chats()
-        by_id = {int(item.get('id', 0)): item for item in saved}
-        for chat_id in non_empty_chat_ids:
-            by_id.pop(int(chat_id), None)
-        for item in empty_chats:
-            by_id[int(item['id'])] = item
-        await self.save_empty_chats(sorted(by_id.values(), key=lambda x: (str(x.get('name') or '').casefold(), int(x.get('id', 0)))))
-
-    async def forget_empty_chat(self, chat_id: int) -> None:
-        empty_chats = await self.get_saved_empty_chats()
-        await self.save_empty_chats([x for x in empty_chats if int(x.get('id', 0)) != chat_id])
-
-    async def get_excluded_chats(self) -> list[dict[str, Any]]:
-        saved = await self.db.kv_get_json(EXCLUDED_CHATS_KEY, [])
-        configured = [{'id': chat_id, 'name': f'ID {chat_id}', 'source': 'config'} for chat_id in sorted(self.excluded)]
-        by_id = {int(item['id']): item for item in configured}
-        for item in saved:
-            by_id[int(item['id'])] = item
-        return sorted(by_id.values(), key=lambda x: (str(x.get('name') or '').casefold(), int(x.get('id', 0))))
-
-    async def exclude_chat(self, chat: dict[str, Any]) -> None:
-        chat_id = int(chat['id'])
-        self.excluded.add(chat_id)
-        saved = await self.db.kv_get_json(EXCLUDED_CHATS_KEY, [])
-        by_id = {int(item['id']): item for item in saved}
-        by_id[chat_id] = {
-            'id': chat_id,
-            'name': chat.get('name') or str(chat_id),
-            'link': chat.get('link'),
-            'excluded_at': int(time.time()),
-            'source': 'manual',
-        }
-        await self.db.kv_set_json(EXCLUDED_CHATS_KEY, sorted(by_id.values(), key=lambda x: (str(x.get('name') or '').casefold(), int(x.get('id', 0)))))
-        await self.forget_empty_chat(chat_id)
-
-    async def restore_excluded_chat(self, chat_id: int) -> None:
-        self.excluded.discard(int(chat_id))
-        saved = await self.db.kv_get_json(EXCLUDED_CHATS_KEY, [])
-        await self.db.kv_set_json(EXCLUDED_CHATS_KEY, [x for x in saved if int(x.get('id', 0)) != int(chat_id)])
-
-    async def get_period_report(self, period: str) -> list[dict[str, Any]]:
-        return await self.db.get_chat_stats(period)
-
-    async def delete_dialog_by_id(self, chat_id: int) -> tuple[bool, str]:
-        async with self._delete_lock:
-            try:
-                entity = await self.client.get_entity(chat_id)
-                if self.dry_run_delete:
-                    return True, 'DRY_RUN_DELETE=1, удаление не выполнялось.'
-                await self.client.delete_dialog(entity)
-                self.heartbeat.beat(status='delete_dialog', chat_id=chat_id)
-                await asyncio.sleep(1.5)
-                return True, 'Диалог удалён/чат покинут.'
-            except FloodWaitError as e:
-                seconds = int(getattr(e, 'seconds', 1))
-                if seconds > self.max_flood_wait_sec:
-                    return False, f'FloodWait {seconds} сек — слишком долго, удаление отменено.'
-                await asyncio.sleep(seconds + 1)
-                return False, f'FloodWait {seconds} сек — попробуй ещё раз позже.'
-            except RPCError as e:
-                return False, f'RPC ошибка: {e.__class__.__name__}'
-            except Exception as e:
-                log.exception('delete_dialog_by_id failed chat_id=%s', chat_id)
-                return False, f'Ошибка: {e.__class__.__name__}'
-
-    def _cleanup_stale_downloads(self) -> None:
-        now = time.time()
-        for item in self.downloads_dir.glob('video_*'):
-            try:
-                if now - item.stat().st_mtime < STALE_DOWNLOAD_MAX_AGE_SEC:
-                    continue
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
-                log.info('Removed stale download item: %s', item)
-            except FileNotFoundError:
-                continue
-            except Exception:
-                log.warning('Failed to remove stale download item: %s', item, exc_info=True)
-
-    def _ensure_download_space(self, expected_size: int) -> None:
-        usage = shutil.disk_usage(self.downloads_dir)
-        required = max(int(expected_size or 0) + self.downloads_reserve_bytes, self.downloads_reserve_bytes)
-        if usage.free >= required:
-            return
-
-        free_mb = usage.free // MB
-        required_mb = required // MB
-        video_mb = int(expected_size or 0) // MB
-        raise InsufficientDownloadSpaceError(
-            f'Недостаточно свободного места в DOWNLOADS_DIR: {free_mb} МБ, '
-            f'нужно минимум {required_mb} МБ (видео {video_mb} МБ + резерв {self.downloads_reserve_bytes // MB} МБ)'
-        )
-
-    async def _download_and_send_video(self, target: Any, msg: Message, expected_size: int) -> None:
-        self.downloads_dir.mkdir(parents=True, exist_ok=True)
-        self._cleanup_stale_downloads()
-        self._ensure_download_space(expected_size)
-        with tempfile.TemporaryDirectory(prefix=f'video_{msg.chat_id}_{msg.id}_', dir=self.downloads_dir) as tmp_dir:
-            downloaded = await self.client.download_media(msg, file=tmp_dir)
-            if not downloaded:
-                raise RuntimeError('download_media returned empty path')
-
-            caption = (msg.message or '').strip() or None
-            if caption and len(caption) > 1024:
-                caption = caption[:1021] + '…'
-
-            await self.client.send_file(
-                target,
-                downloaded,
-                caption=caption,
-                supports_streaming=True,
-            )
-
-    async def _deliver_video(self, target: Any, msg: Message, expected_size: int) -> None:
-        await self._download_and_send_video(target, msg, expected_size)
+        items: list[dict[str, Any]] = []
+        for dialog in scan_dialogs:
+            username = getattr(dialog.entity, 'username', None)
+            items.append({
+                'id': int(dialog.id),
+                'name': dialog.name or str(dialog.id),
+                'type': _dialog_type_label(dialog),
+                'is_group': bool(dialog.is_group),
+                'is_channel': bool(dialog.is_channel),
+                'link': f'https://t.me/{username}' if username else None,
+                'username': username,
+            })
+        return items
 
     async def scan(
         self,
@@ -374,26 +166,19 @@ class Scanner:
             lambda: self.client.get_entity(self.target_bot_username),
         )
         dialogs = await self._run_with_connection_recovery('collect_dialogs', lambda: self._collect_dialogs(opts))
-
         since = _since_dt(opts.mode)
+
         total_checked = 0
-        total_matched = 0
         total_forwarded = 0
-        total_errors = 0
         total_skipped = 0
-        total_video_found = 0
-        reject_reasons = {'not_vertical': 0, 'too_short': 0, 'too_narrow': 0, 'too_small': 0}
-        per_chat_stats: list[dict[str, Any]] = []
+        total_errors = 0
         cancelled = False
-        empty_chats: list[dict[str, Any]] = []
-        non_empty_chat_ids: set[int] = set()
-        can_replace_empty_list = opts.mode == 'all' and opts.chat_ids is None
 
         if progress_cb:
             await progress_cb({'type': 'init', 'dialogs_total': len(dialogs), 'mode': opts.mode, 'order': opts.order})
 
-        log.info('Scan init: dialogs=%d mode=%s order=%s', len(dialogs), opts.mode, opts.order)
-        self.heartbeat.beat(status='scan_start', dialogs_total=len(dialogs), mode=opts.mode, order=opts.order)
+        log.info('Forwarding init: dialogs=%d mode=%s order=%s', len(dialogs), opts.mode, opts.order)
+        self.heartbeat.beat(status='forward_start', dialogs_total=len(dialogs), mode=opts.mode, order=opts.order)
 
         for idx, dialog in enumerate(dialogs, start=1):
             chat_id = int(dialog.id)
@@ -402,267 +187,119 @@ class Scanner:
                 break
 
             dialog_name = dialog.name or str(chat_id)
-            limit = None
-            min_id = 0
+            min_id = await self.db.get_last_scanned(chat_id) if opts.mode == 'new' else 0
+            max_id_seen = min_id
             reverse = opts.order == 'old_to_new'
-            max_id_seen = 0
-            checked_in_chat = 0
-            matched_in_chat = 0
-            forwarded_in_chat = 0
-            video_found_in_chat = 0
-            hard_stopped_by_date = False
-            chat_had_error = False
             chat_finished_cleanly = False
 
-            if opts.mode == 'new':
-                min_id = await self.db.get_last_scanned(chat_id)
-                max_id_seen = min_id
-
             if progress_cb:
-                await progress_cb({
-                    'type': 'chat_start',
-                    'chat_index': idx,
-                    'dialogs_total': len(dialogs),
-                    'chat_id': chat_id,
-                    'chat_name': dialog_name,
-                })
+                await progress_cb({'type': 'chat_start', 'chat_index': idx, 'dialogs_total': len(dialogs), 'chat_id': chat_id, 'chat_name': dialog_name})
 
             try:
                 last_heartbeat_at = 0.0
-                async for msg in self.client.iter_messages(chat_id, limit=limit, min_id=min_id, reverse=reverse):
-                    now_monotonic = time.monotonic()
-                    if checked_in_chat == 0 or now_monotonic - last_heartbeat_at >= 5.0:
-                        last_heartbeat_at = now_monotonic
-                        self.heartbeat.beat(
-                            status='scan_message',
-                            chat_id=chat_id,
-                            chat_name=dialog_name,
-                            chat_index=idx,
-                            dialogs_total=len(dialogs),
-                            checked=total_checked,
-                            matched=total_matched,
-                            forwarded=total_forwarded,
-                        )
-
+                async for msg in self.client.iter_messages(chat_id, limit=None, min_id=min_id, reverse=reverse):
                     if cancel_event.is_set():
                         cancelled = True
                         break
-
-                    if not msg:
+                    if not isinstance(msg, Message) or not msg.id:
                         continue
 
-                    checked_in_chat += 1
                     total_checked += 1
+                    max_id_seen = max(max_id_seen, int(msg.id))
 
-                    if msg.id and msg.id > max_id_seen:
-                        max_id_seen = msg.id
+                    now_monotonic = time.monotonic()
+                    if now_monotonic - last_heartbeat_at >= 5.0:
+                        last_heartbeat_at = now_monotonic
+                        self.heartbeat.beat(status='forward_message', chat_id=chat_id, chat_name=dialog_name, chat_index=idx, dialogs_total=len(dialogs), checked=total_checked, forwarded=total_forwarded)
 
                     if since and msg.date:
                         msg_dt = msg.date if msg.date.tzinfo else msg.date.replace(tzinfo=timezone.utc)
                         msg_dt = msg_dt.astimezone(timezone.utc)
                         if msg_dt < since and not reverse:
-                            hard_stopped_by_date = True
                             break
                         if msg_dt < since and reverse:
                             continue
-
-                    meta = _extract_video_meta(msg)
-                    if not meta:
-                        if progress_cb and checked_in_chat % 1000 == 0:
-                            await progress_cb({'type': 'tick', 'chat_id': chat_id, 'checked': total_checked, 'matched': total_matched, 'forwarded': total_forwarded})
-                        continue
-
-                    total_video_found += 1
-                    video_found_in_chat += 1
-                    w, h, duration, size = meta
-                    reject_reason = _reject_reason(w, h, duration, size)
-                    if reject_reason:
-                        reject_reasons[reject_reason] += 1
-                        continue
-
-                    matched_in_chat += 1
-                    total_matched += 1
 
                     if await self.db.was_forwarded(chat_id, msg.id):
                         total_skipped += 1
                         continue
 
                     try:
-                        await self._deliver_video(target, msg, size)
+                        await self.client.forward_messages(target, msg)
                     except FloodWaitError as e:
                         seconds = int(getattr(e, 'seconds', 1))
                         if progress_cb:
                             await progress_cb({'type': 'floodwait', 'chat_id': chat_id, 'seconds': seconds})
                         if seconds > self.max_flood_wait_sec:
                             total_errors += 1
-                            log.warning('FloodWait too long: %ss chat_id=%s msg_id=%s', seconds, chat_id, msg.id)
                             cancelled = True
                             cancel_event.set()
                             break
                         await asyncio.sleep(seconds + 1)
-                        await self._deliver_video(target, msg, size)
-                    except InsufficientDownloadSpaceError as e:
+                        await self.client.forward_messages(target, msg)
+                    except RPCError as e:
                         total_errors += 1
-                        log.warning(
-                            'Skip video because DOWNLOADS_DIR has not enough space: chat_id=%s msg_id=%s error=%s',
-                            chat_id,
-                            msg.id,
-                            e,
-                        )
-                        if progress_cb:
-                            await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': str(e)})
+                        log.warning('Skip message due RPC error: chat_id=%s msg_id=%s error=%s', chat_id, msg.id, e.__class__.__name__)
                         continue
                     except Exception as e:
                         if not _is_connection_error(e):
                             raise
-                        log.warning('Connection error while delivering chat_id=%s msg_id=%s: %s', chat_id, msg.id, e.__class__.__name__)
-                        if not await self._recover_connection(f'deliver chat_id={chat_id} msg_id={msg.id}'):
+                        if not await self._recover_connection(f'forward chat_id={chat_id} msg_id={msg.id}'):
                             raise
-                        await self._deliver_video(target, msg, size)
+                        await self.client.forward_messages(target, msg)
 
                     await self.db.mark_forwarded(chat_id, msg.id, int(time.time()))
-                    forwarded_in_chat += 1
                     total_forwarded += 1
 
-                    log.info(
-                        'Delivered downloaded video: chat_id=%s msg_id=%s duration=%ss w=%s h=%s size=%s',
-                        chat_id,
-                        msg.id,
-                        duration,
-                        w,
-                        h,
-                        size,
-                    )
-
                     if progress_cb:
-                        await progress_cb({
-                            'type': 'forward',
-                            'chat_id': chat_id,
-                            'chat_name': dialog_name,
-                            'msg_id': msg.id,
-                            'checked': total_checked,
-                            'matched': total_matched,
-                            'forwarded': total_forwarded,
-                        })
+                        await progress_cb({'type': 'forward', 'chat_id': chat_id, 'chat_name': dialog_name, 'msg_id': msg.id, 'checked': total_checked, 'forwarded': total_forwarded})
 
-                    delay = self.forward_delay_sec + random.uniform(0, self.forward_jitter_sec)
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(self.forward_delay_sec + random.uniform(0, self.forward_jitter_sec))
 
                 chat_finished_cleanly = not cancelled
 
             except FloodWaitError as e:
-                chat_had_error = True
                 total_errors += 1
                 wait_s = int(getattr(e, 'seconds', 1))
-                log.warning('FloodWait %ss on chat_id=%s', wait_s, chat_id)
-                if progress_cb:
-                    await progress_cb({'type': 'floodwait', 'chat_id': chat_id, 'seconds': wait_s})
                 if wait_s > self.max_flood_wait_sec:
                     cancelled = True
                     cancel_event.set()
                     break
                 await asyncio.sleep(wait_s + 1)
             except RPCError:
-                chat_had_error = True
                 total_errors += 1
                 log.exception('RPC error on chat_id=%s', chat_id)
-                if progress_cb:
-                    await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'rpc_error'})
             except Exception as e:
-                chat_had_error = True
                 total_errors += 1
                 if _is_connection_error(e):
                     log.warning('Connection error on chat_id=%s: %s', chat_id, e.__class__.__name__)
-                    if progress_cb:
-                        await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'connection_error'})
                     if not await self._recover_connection(f'chat_id={chat_id}'):
                         cancelled = True
                         cancel_event.set()
                         break
                 else:
                     log.exception('Unexpected error on chat_id=%s', chat_id)
-                    if progress_cb:
-                        await progress_cb({'type': 'error', 'chat_id': chat_id, 'error': 'exception'})
             finally:
                 if opts.mode == 'new' and chat_finished_cleanly and max_id_seen > min_id:
                     await self.db.set_last_scanned(chat_id, max_id_seen, int(time.time()))
 
-            if not chat_had_error:
-                per_chat_stats.append(
-                    {
-                        'id': chat_id,
-                        'name': dialog_name,
-                        'checked': checked_in_chat,
-                        'matched': matched_in_chat,
-                        'video_found': video_found_in_chat,
-                        'forwarded': forwarded_in_chat,
-                        'link': f'https://t.me/{getattr(dialog.entity, "username", None)}' if getattr(dialog.entity, 'username', None) else None,
-                    }
-                )
-
-            if not chat_had_error and matched_in_chat > 0:
-                non_empty_chat_ids.add(chat_id)
-
-            if not chat_had_error and matched_in_chat == 0:
-                username = getattr(dialog.entity, 'username', None)
-                link = f'https://t.me/{username}' if username else None
-                empty_chats.append(
-                    {
-                        'id': chat_id,
-                        'name': dialog_name,
-                        'link': link,
-                        'username': username,
-                        'checked': checked_in_chat,
-                        'matched': matched_in_chat,
-                        'video_found': video_found_in_chat,
-                        'forwarded': forwarded_in_chat,
-                        'by_date_stop': hard_stopped_by_date,
-                        'is_user': bool(dialog.is_user),
-                        'is_group': bool(dialog.is_group),
-                        'is_channel': bool(dialog.is_channel),
-                        'type': _dialog_type_label(dialog),
-                    }
-                )
-
             if progress_cb:
-                await progress_cb({
-                    'type': 'chat_done',
-                    'chat_id': chat_id,
-                    'chat_name': dialog_name,
-                    'chat_index': idx,
-                    'dialogs_total': len(dialogs),
-                    'checked': total_checked,
-                    'matched': total_matched,
-                    'forwarded': total_forwarded,
-                })
+                await progress_cb({'type': 'chat_done', 'chat_id': chat_id, 'chat_name': dialog_name, 'chat_index': idx, 'dialogs_total': len(dialogs), 'checked': total_checked, 'forwarded': total_forwarded})
 
             await asyncio.sleep(self.dialog_delay_sec)
-            if cancelled:
-                break
 
         elapsed = int(time.time() - start_ts)
         result = {
             'dialogs': len(dialogs),
             'checked': total_checked,
-            'video_found': total_video_found,
-            'matched': total_matched,
             'forwarded': total_forwarded,
             'skipped_already_forwarded': total_skipped,
-            'reject_reasons': reject_reasons,
-            'top_chats': sorted(per_chat_stats, key=lambda x: (x['matched'], x['forwarded'], x['checked']), reverse=True)[:10],
             'errors': total_errors,
-            'empty_chats_count': len(empty_chats),
-            'empty_chats_updated': bool(empty_chats or non_empty_chat_ids),
             'cancelled': cancelled,
             'elapsed_sec': elapsed,
         }
-
-        await self.update_empty_chats(empty_chats, non_empty_chat_ids, replace=can_replace_empty_list and not cancelled)
-        await self.db.upsert_chat_stats(opts.mode, per_chat_stats, int(time.time()))
-
-        result_summary = {k: result[k] for k in ('dialogs', 'checked', 'matched', 'forwarded', 'errors', 'empty_chats_count', 'cancelled', 'elapsed_sec')}
-        log.info('Scan finish: %s', result_summary)
-        self.heartbeat.beat(status='scan_done', result_summary=result_summary)
+        log.info('Forwarding finish: %s', result)
+        self.heartbeat.beat(status='forward_done', result_summary=result)
         if progress_cb:
             await progress_cb({'type': 'done', **result})
         return result
