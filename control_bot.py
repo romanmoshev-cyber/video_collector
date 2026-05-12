@@ -70,7 +70,7 @@ def _main_reply_kb(is_scanning: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text='🔎 Все'), KeyboardButton(text='📌 Выбрать')],
         [KeyboardButton(text='⏱ Период'), KeyboardButton(text='🔁 Порядок')],
-        [KeyboardButton(text='📄 Статус')],
+        [KeyboardButton(text='📄 Статус'), KeyboardButton(text='📊 Чаты')],
     ]
     if is_scanning:
         rows.append([KeyboardButton(text='⛔ Стоп')])
@@ -107,7 +107,8 @@ def _help_text() -> str:
         '/status — состояние процесса.\n'
         '/help — справка.\n\n'
         'Выбери период и источники: все каналы/группы или только отмеченные. '
-        'Кнопка «Стоп» мягко останавливает текущую пересылку.'
+        'Кнопка «Стоп» мягко останавливает текущую пересылку. '
+        'Кнопка «📊 Чаты» показывает статистику видео по источникам.'
     )
 
 
@@ -137,7 +138,7 @@ def _pick_text(dialogs: list[dict[str, Any]], selected: set[int], page: int, per
         '📌 <b>Выбор источников</b>\n'
         f'Страница: <b>{page + 1} / {pages}</b> · всего: <b>{len(dialogs)}</b>\n'
         f'Выбрано: <b>{len(selected)}</b>\n\n'
-        'В списке только каналы и группы.'
+        'В списке только каналы и группы. 🗑 удаляет чат из проверок.'
     )
 
 
@@ -150,10 +151,9 @@ def _pick_kb(dialogs: list[dict[str, Any]], selected: set[int], page: int, per_p
         mark = '✅' if did in selected else '＋'
         type_icon = '👥' if item.get('is_group') else '📣'
         kb.button(text=f'{mark} {type_icon} {_short_title(item.get("name") or "")}', callback_data=f'pick:toggle:{did}')
+        kb.button(text='🗑', callback_data=f'pick:delete:{did}')
 
-    sizes = [2] * (len(chunk) // 2)
-    if len(chunk) % 2:
-        sizes.append(1)
+    sizes = [2] * len(chunk)
 
     nav_count = 0
     if page > 0:
@@ -175,6 +175,40 @@ def _pick_kb(dialogs: list[dict[str, Any]], selected: set[int], page: int, per_p
     kb.adjust(*sizes)
     return kb.as_markup()
 
+
+
+
+def _stats_report_chunks(items: list[dict[str, Any]], mode: str, limit: int = 3600) -> list[str]:
+    header = (
+        '📊 <b>Статистика чатов</b>\n'
+        f'Период: <b>{escape(_mode_label(mode))}</b>\n'
+        'Видео — все найденные видео за период. Подошло — видео, которые ещё не пересылались.\n\n'
+    )
+    if not items:
+        return [header + 'Нет доступных чатов.']
+
+    total_videos = sum(int(item.get('videos_total', 0)) for item in items)
+    total_matched = sum(int(item.get('videos_matched', 0)) for item in items)
+    lines = [f'Итого: <b>{total_videos}</b> видео, подошло: <b>{total_matched}</b>\n']
+    for item in sorted(items, key=lambda x: (int(x.get('videos_matched', 0)), int(x.get('videos_total', 0))), reverse=True):
+        icon = '👥' if item.get('is_group') else '📣'
+        lines.append(
+            f'{icon} <b>{escape(_short_title(str(item.get("name", "")), 42))}</b> '
+            f'— видео: <b>{int(item.get("videos_total", 0))}</b>, '
+            f'подошло: <b>{int(item.get("videos_matched", 0))}</b>'
+        )
+
+    chunks: list[str] = []
+    current = header
+    for line in lines:
+        candidate = current + line + '\n'
+        if len(candidate) > limit and current != header:
+            chunks.append(current.rstrip())
+            current = header + line + '\n'
+        else:
+            current = candidate
+    chunks.append(current.rstrip())
+    return chunks
 
 def _format_duration(seconds: int | float) -> str:
     seconds = int(seconds or 0)
@@ -321,6 +355,15 @@ async def run_control_bot(
             for item in st.dialogs_cache[st.page * per_page:st.page * per_page + per_page]:
                 st.selected_chats.discard(int(item['id']))
             await c.answer('Страница снята')
+        elif action == 'delete':
+            chat_id = int(parts[2])
+            chat = next((item for item in st.dialogs_cache if int(item['id']) == chat_id), None)
+            await scanner.exclude_chat(chat_id, str(chat.get('name') if chat else chat_id))
+            st.selected_chats.discard(chat_id)
+            st.dialogs_cache = [item for item in st.dialogs_cache if int(item['id']) != chat_id]
+            max_page = max(0, (len(st.dialogs_cache) - 1) // per_page)
+            st.page = min(st.page, max_page)
+            await c.answer('Чат удалён из проверок')
         elif action == 'refresh':
             await refresh_dialogs(st)
             await c.answer('Список обновлён')
@@ -329,6 +372,48 @@ async def run_control_bot(
             await c.answer('Выбор очищен')
 
         await safe_edit_text(c.message, _pick_text(st.dialogs_cache, st.selected_chats, st.page), reply_markup=_pick_kb(st.dialogs_cache, st.selected_chats, st.page))
+
+
+    @dp.message(F.text == '📊 Чаты')
+    async def chat_stats(m: Message):
+        if not _is_allowed(m.from_user.id, allowed_users):
+            return
+        st = await get_state(m.from_user.id)
+        progress_msg = await m.answer('📊 Считаю видео по чатам…')
+        state = {'chat_index': 0, 'dialogs_total': 0, 'chat_name': '—'}
+        last_edit = 0.0
+
+        async def progress_cb(ev: dict[str, Any]) -> None:
+            nonlocal last_edit
+            now = time.monotonic()
+            if 'dialogs_total' in ev:
+                state['dialogs_total'] = int(ev['dialogs_total'])
+            if 'chat_index' in ev:
+                state['chat_index'] = int(ev['chat_index'])
+            if 'chat_name' in ev:
+                state['chat_name'] = ev['chat_name']
+            if now - last_edit < progress_edit_interval_sec and ev.get('type') != 'stats_init':
+                return
+            last_edit = now
+            await safe_edit_text(
+                progress_msg,
+                '📊 <b>Считаю статистику</b>\n'
+                f'Период: <b>{escape(_mode_label(st.mode))}</b>\n'
+                f'Чат: <b>{state["chat_index"]} / {state["dialogs_total"]}</b>\n'
+                f'Текущий: <b>{escape(str(state["chat_name"]))}</b>',
+            )
+
+        try:
+            items = await scanner.list_dialog_video_stats(mode=st.mode, progress_cb=progress_cb)
+        except Exception as e:
+            log.exception('chat stats failed')
+            await safe_edit_text(progress_msg, f'❌ Ошибка статистики: <code>{escape(e.__class__.__name__)}</code>')
+            return
+
+        chunks = _stats_report_chunks(items, st.mode)
+        await safe_edit_text(progress_msg, chunks[0], reply_markup=_main_reply_kb(scan_lock.locked()))
+        for chunk in chunks[1:]:
+            await m.answer(chunk, reply_markup=_main_reply_kb(scan_lock.locked()))
 
     async def start_forward(message: Message, user_id: int, st: UserState, kind: str) -> None:
         if scan_lock.locked():
