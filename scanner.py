@@ -94,17 +94,30 @@ def _dialog_name(dialog: Dialog) -> str:
     return (dialog.name or '').strip()
 
 
-def _should_scan_dialog(dialog: Dialog) -> bool:
+def _dialog_type_label(dialog: Dialog) -> str:
+    if dialog.is_user:
+        return 'личный чат'
+    if dialog.is_group:
+        return 'группа'
+    if dialog.is_channel:
+        return 'канал'
+    return 'чат'
+
+
+def _should_scan_dialog(dialog: Dialog, target_bot_username: str = '') -> bool:
     name = _dialog_name(dialog)
     normalized_name = name.casefold()
 
     if getattr(dialog.entity, 'self', False):
         return False
+    username = (getattr(dialog.entity, 'username', None) or '').casefold().lstrip('@')
+    if target_bot_username and username == target_bot_username.casefold().lstrip('@'):
+        return False
     if normalized_name in SKIPPED_DIALOG_NAMES:
         return False
     if normalized_name.startswith(SKIPPED_DIALOG_PREFIXES):
         return False
-    return bool(dialog.is_group or dialog.is_channel)
+    return bool(dialog.is_user or dialog.is_group or dialog.is_channel)
 
 
 EMPTY_CHATS_KEY = 'empty_chats:last_full_scan'
@@ -192,7 +205,7 @@ class Scanner:
         async for d in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
             if d.id in self.excluded:
                 continue
-            if not _should_scan_dialog(d):
+            if not _should_scan_dialog(d, self.target_bot_username):
                 continue
             if opts and opts.chat_ids is not None and d.id not in opts.chat_ids:
                 continue
@@ -214,6 +227,7 @@ class Scanner:
                     'is_user': bool(d.is_user),
                     'is_group': bool(d.is_group),
                     'is_channel': bool(d.is_channel),
+                    'type': _dialog_type_label(d),
                     'link': link,
                     'username': username,
                 }
@@ -603,8 +617,10 @@ class Scanner:
                         'video_found': video_found_in_chat,
                         'forwarded': forwarded_in_chat,
                         'by_date_stop': hard_stopped_by_date,
+                        'is_user': bool(dialog.is_user),
                         'is_group': bool(dialog.is_group),
                         'is_channel': bool(dialog.is_channel),
+                        'type': _dialog_type_label(dialog),
                     }
                 )
 
