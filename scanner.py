@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, Optional
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.custom.dialog import Dialog
-from telethon.tl.types import Message, MessageMediaDocument
+from telethon.tl.types import DocumentAttributeVideo, Message, MessageMediaDocument
 
 from db import DB
 from watchdog import Heartbeat
@@ -25,6 +25,22 @@ class ScanOptions:
     mode: str
     chat_ids: Optional[set[int]]
     order: str
+
+
+@dataclass(frozen=True)
+class VideoFilter:
+    vertical_only: bool = True
+    exact_width: int = 0
+    exact_height: int = 0
+    min_width: int = 900
+    min_height: int = 0
+    max_width: int = 0
+    max_height: int = 0
+    min_duration_sec: float = 180.0
+    max_duration_sec: float = 0.0
+    min_size_mb: float = 0.0
+    max_size_mb: float = 0.0
+    min_size_mb_per_minute: float = 10.0
 
 
 def _since_dt(mode: str) -> Optional[datetime]:
@@ -85,6 +101,7 @@ class Scanner:
         forward_jitter_sec: float,
         dialog_delay_sec: float,
         max_flood_wait_sec: int,
+        video_filter: VideoFilter | None = None,
     ):
         self.client = client
         self.db = db
@@ -95,17 +112,67 @@ class Scanner:
         self.forward_jitter_sec = max(0.0, forward_jitter_sec)
         self.dialog_delay_sec = max(0.0, dialog_delay_sec)
         self.max_flood_wait_sec = max_flood_wait_sec
+        self.video_filter = video_filter or VideoFilter()
 
     @staticmethod
-    def _is_video_message(msg: Message) -> bool:
-        if getattr(msg, 'video', None):
-            return True
+    def _video_document(msg: Message) -> Any | None:
         media = getattr(msg, 'media', None)
         document = getattr(media, 'document', None) if isinstance(media, MessageMediaDocument) else getattr(msg, 'document', None)
         if not document:
-            return False
+            return None
+        if getattr(msg, 'video', None):
+            return document
         mime_type = (getattr(document, 'mime_type', '') or '').casefold()
-        return mime_type.startswith('video/')
+        return document if mime_type.startswith('video/') else None
+
+    @staticmethod
+    def _video_dimensions_and_duration(document: Any) -> tuple[int, int, float]:
+        for attr in getattr(document, 'attributes', []) or []:
+            if isinstance(attr, DocumentAttributeVideo):
+                width = int(getattr(attr, 'w', 0) or 0)
+                height = int(getattr(attr, 'h', 0) or 0)
+                duration = float(getattr(attr, 'duration', 0) or 0)
+                return width, height, duration
+        return 0, 0, 0.0
+
+    def _is_video_message(self, msg: Message) -> bool:
+        document = self._video_document(msg)
+        if not document:
+            return False
+
+        width, height, duration = self._video_dimensions_and_duration(document)
+        size = int(getattr(document, 'size', 0) or 0)
+        rules = self.video_filter
+
+        if rules.vertical_only and (not width or not height or height <= width):
+            return False
+        if rules.exact_width > 0 and width != rules.exact_width:
+            return False
+        if rules.exact_height > 0 and height != rules.exact_height:
+            return False
+        if rules.min_width > 0 and width < rules.min_width:
+            return False
+        if rules.min_height > 0 and height < rules.min_height:
+            return False
+        if rules.max_width > 0 and width > rules.max_width:
+            return False
+        if rules.max_height > 0 and height > rules.max_height:
+            return False
+        if rules.min_duration_sec > 0 and duration < rules.min_duration_sec:
+            return False
+        if rules.max_duration_sec > 0 and duration > rules.max_duration_sec:
+            return False
+        if rules.min_size_mb > 0 and size < int(rules.min_size_mb * 1024 * 1024):
+            return False
+        if rules.max_size_mb > 0 and size > int(rules.max_size_mb * 1024 * 1024):
+            return False
+        if rules.min_size_mb_per_minute > 0:
+            if duration <= 0:
+                return False
+            size_mb_per_minute = (size / 1024 / 1024) / (duration / 60)
+            if size_mb_per_minute < rules.min_size_mb_per_minute:
+                return False
+        return True
 
     async def _ensure_connected(self) -> None:
         if self.client.is_connected():
@@ -156,7 +223,7 @@ class Scanner:
     async def _collect_dialogs(self, opts: ScanOptions | None = None) -> list[Dialog]:
         await self._load_manual_excluded()
         dialogs: list[Dialog] = []
-        async for dialog in self.client.iter_dialogs(limit=10000, ignore_migrated=True):
+        async for dialog in self.client.iter_dialogs(limit=None, ignore_migrated=True):
             if int(dialog.id) in self.excluded:
                 continue
             if not _should_scan_dialog(dialog, self.target_bot_username):

@@ -10,7 +10,7 @@ from telethon import TelegramClient
 from config import load_config
 from control_bot import run_control_bot
 from db import DB
-from scanner import Scanner
+from scanner import Scanner, VideoFilter
 from watchdog import Heartbeat, WatchdogKiller, heartbeat_loop
 
 
@@ -106,6 +106,20 @@ async def async_main() -> None:
             forward_jitter_sec=cfg.forward_jitter_sec,
             dialog_delay_sec=cfg.dialog_delay_sec,
             max_flood_wait_sec=cfg.max_flood_wait_sec,
+            video_filter=VideoFilter(
+                vertical_only=cfg.video_vertical_only,
+                exact_width=cfg.video_exact_width,
+                exact_height=cfg.video_exact_height,
+                min_width=cfg.video_min_width,
+                min_height=cfg.video_min_height,
+                max_width=cfg.video_max_width,
+                max_height=cfg.video_max_height,
+                min_duration_sec=cfg.video_min_duration_sec,
+                max_duration_sec=cfg.video_max_duration_sec,
+                min_size_mb=cfg.video_min_size_mb,
+                max_size_mb=cfg.video_max_size_mb,
+                min_size_mb_per_minute=cfg.video_min_size_mb_per_minute,
+            ),
         )
 
         hb_task = asyncio.create_task(heartbeat_loop(heartbeat, interval_sec=10))

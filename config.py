@@ -39,6 +39,12 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, '').strip().casefold()
+    if not value:
+        return default
+    return value in {'1', 'true', 'yes', 'y', 'on', 'да'}
+
 
 @dataclass(frozen=True)
 class Config:
@@ -66,6 +72,18 @@ class Config:
     connection_retries: int
     flood_sleep_threshold: int
     connect_timeout_sec: int
+    video_vertical_only: bool
+    video_exact_width: int
+    video_exact_height: int
+    video_min_width: int
+    video_min_height: int
+    video_max_width: int
+    video_max_height: int
+    video_min_duration_sec: float
+    video_max_duration_sec: float
+    video_min_size_mb: float
+    video_max_size_mb: float
+    video_min_size_mb_per_minute: float
 
 
 def load_config() -> Config:
@@ -95,6 +113,18 @@ def load_config() -> Config:
     connection_retries = _int('CONNECTION_RETRIES', 5)
     flood_sleep_threshold = _int('FLOOD_SLEEP_THRESHOLD', 60)
     connect_timeout_sec = _int('CONNECT_TIMEOUT_SEC', 15)
+    video_vertical_only = _bool('VIDEO_VERTICAL_ONLY', True)
+    video_exact_width = _int('VIDEO_EXACT_WIDTH', 0)
+    video_exact_height = _int('VIDEO_EXACT_HEIGHT', 0)
+    video_min_width = _int('VIDEO_MIN_WIDTH', 900)
+    video_min_height = _int('VIDEO_MIN_HEIGHT', 0)
+    video_max_width = _int('VIDEO_MAX_WIDTH', 0)
+    video_max_height = _int('VIDEO_MAX_HEIGHT', 0)
+    video_min_duration_sec = _float('VIDEO_MIN_DURATION_SEC', 180.0)
+    video_max_duration_sec = _float('VIDEO_MAX_DURATION_SEC', 0.0)
+    video_min_size_mb = _float('VIDEO_MIN_SIZE_MB', 0.0)
+    video_max_size_mb = _float('VIDEO_MAX_SIZE_MB', 0.0)
+    video_min_size_mb_per_minute = _float('VIDEO_MIN_SIZE_MB_PER_MINUTE', 10.0)
 
     if not bot_token:
         raise ValueError('BOT_TOKEN is empty')
@@ -128,4 +158,16 @@ def load_config() -> Config:
         connection_retries=connection_retries,
         flood_sleep_threshold=flood_sleep_threshold,
         connect_timeout_sec=connect_timeout_sec,
+        video_vertical_only=video_vertical_only,
+        video_exact_width=video_exact_width,
+        video_exact_height=video_exact_height,
+        video_min_width=video_min_width,
+        video_min_height=video_min_height,
+        video_max_width=video_max_width,
+        video_max_height=video_max_height,
+        video_min_duration_sec=video_min_duration_sec,
+        video_max_duration_sec=video_max_duration_sec,
+        video_min_size_mb=video_min_size_mb,
+        video_max_size_mb=video_max_size_mb,
+        video_min_size_mb_per_minute=video_min_size_mb_per_minute,
     )
