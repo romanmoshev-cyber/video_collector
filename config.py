@@ -57,6 +57,7 @@ class Config:
     allowed_users: set[int]
     excluded_chat_ids: set[int]
     target_bot_username: str
+    horizontal_target: str
     log_level: str
     database_path: Path
     logs_dir: Path
@@ -89,6 +90,7 @@ def load_config() -> Config:
     allowed_users = _csv_ints('ALLOWED_USERS')
     excluded_chat_ids = _csv_ints('EXCLUDED_CHAT_IDS')
     target_bot_username = os.getenv('TARGET_BOT_USERNAME', 'Content_Vertical_BOT').strip().lstrip('@')
+    horizontal_target = os.getenv('HORIZONTAL_TARGET', '8978204314').strip().lstrip('@')
     log_level = os.getenv('LOG_LEVEL', 'INFO').strip().upper()
 
     database_path = Path(os.getenv('DATABASE_PATH', str(BASE_DIR / 'data' / 'bot.sqlite3'))).resolve()
@@ -119,6 +121,8 @@ def load_config() -> Config:
         raise ValueError('API_ID/API_HASH are empty')
     if not phone:
         raise ValueError('PHONE is empty (needed for first MTProto login)')
+    if not horizontal_target:
+        raise ValueError('HORIZONTAL_TARGET is empty')
     if ytdlp_cookies_file and not ytdlp_cookies_file.exists():
         raise ValueError(f'YTDLP_COOKIES_FILE does not exist: {ytdlp_cookies_file}')
 
@@ -132,6 +136,7 @@ def load_config() -> Config:
         allowed_users=allowed_users,
         excluded_chat_ids=excluded_chat_ids,
         target_bot_username=target_bot_username,
+        horizontal_target=horizontal_target,
         log_level=log_level,
         database_path=database_path,
         logs_dir=logs_dir,

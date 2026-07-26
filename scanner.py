@@ -164,13 +164,24 @@ def _extract_video_meta(msg: Message) -> tuple[int, int, int, int] | None:
     return int(w), int(h), int(duration), size
 
 
+def _video_orientation(w: int, h: int) -> str | None:
+    if h > w:
+        return 'vertical'
+    if w > h:
+        return 'horizontal'
+    return None
+
+
 def _reject_reason(w: int, h: int, duration: int, size: int) -> str | None:
-    if h <= w:
-        return 'not_vertical'
+    orientation = _video_orientation(w, h)
+    if orientation is None:
+        return 'square'
     if duration < 180:
         return 'too_short'
-    if w < 900:
+    if orientation == 'vertical' and w < 900:
         return 'too_narrow'
+    if orientation == 'horizontal' and h < 720:
+        return 'too_low_resolution'
     min_size = (duration / 60.0) * (10 * MB)
     if size < min_size:
         return 'too_small'
@@ -446,6 +457,7 @@ class Scanner:
         heartbeat: Heartbeat,
         excluded_chat_ids: set[int],
         target_bot_username: str,
+        horizontal_target: str,
         forward_delay_sec: float,
         forward_jitter_sec: float,
         dialog_delay_sec: float,
@@ -461,6 +473,7 @@ class Scanner:
         self.heartbeat = heartbeat
         self.excluded = excluded_chat_ids
         self.target_bot_username = target_bot_username
+        self.horizontal_target = horizontal_target
         self.forward_delay_sec = max(0.3, forward_delay_sec)
         self.forward_jitter_sec = max(0.0, forward_jitter_sec)
         self.dialog_delay_sec = max(0.0, dialog_delay_sec)
@@ -471,6 +484,24 @@ class Scanner:
         self.max_upload_size = max(1, max_upload_size_mb) * MB
         self.min_free_disk = max(0, min_free_disk_mb) * MB
         self._delete_lock = asyncio.Lock()
+
+    @staticmethod
+    def _target_ref(value: str) -> str | int:
+        return int(value) if value.lstrip('-').isdigit() else value
+
+    async def _get_target(self, value: str) -> Any:
+        target_ref = self._target_ref(value)
+        return await self._run_with_connection_recovery(
+            f'get_entity:{value}',
+            lambda: self.client.get_entity(target_ref),
+        )
+
+    async def _target_for_video(self, w: int, h: int) -> tuple[Any, str]:
+        orientation = _video_orientation(w, h)
+        if orientation is None:
+            raise ValueError('Квадратные видео не отправляются')
+        value = self.target_bot_username if orientation == 'vertical' else self.horizontal_target
+        return await self._get_target(value), orientation
 
     async def _ensure_connected(self) -> None:
         if self.client.is_connected():
@@ -983,10 +1014,6 @@ class Scanner:
         self._ensure_download_dir_ready()
         work_dir = self.download_dir / f'external_{source_id}'
         work_dir.mkdir(parents=True, exist_ok=True)
-        target = await self._run_with_connection_recovery(
-            f'get_entity:{self.target_bot_username}',
-            lambda: self.client.get_entity(self.target_bot_username),
-        )
         try:
             downloaded_path, info = await self._download_external_video(
                 clean_url,
@@ -996,6 +1023,12 @@ class Scanner:
             )
             downloaded_size = downloaded_path.stat().st_size
             meta_summary = _video_meta_summary_from_info(info, downloaded_path)
+            reject_reason = _reject_reason(
+                meta_summary['width'], meta_summary['height'], meta_summary['duration'], downloaded_size
+            )
+            if reject_reason:
+                raise ValueError(f'Видео не подходит: {reject_reason}')
+            target, orientation = await self._target_for_video(meta_summary['width'], meta_summary['height'])
             attributes = _video_attributes_from_info(info)
             duration = info.get('duration')
             if progress_cb:
@@ -1039,6 +1072,7 @@ class Scanner:
                 'size': downloaded_size,
                 'size_human': meta_summary['size_human'],
                 'target_message_id': target_msg_id,
+                'orientation': orientation,
                 'elapsed_sec': int(time.time() - start_ts),
             }
         except Exception:
@@ -1051,10 +1085,6 @@ class Scanner:
             return await self._process_external_video_url(clean_link, progress_cb=progress_cb)
 
         start_ts = time.time()
-        target = await self._run_with_connection_recovery(
-            f'get_entity:{self.target_bot_username}',
-            lambda: self.client.get_entity(self.target_bot_username),
-        )
         entity, msg = await self._run_with_connection_recovery('resolve_video_link', lambda: self._resolve_telegram_video_link(clean_link))
         chat_id = int(getattr(entity, 'id', 0) or getattr(msg, 'chat_id', 0) or 0)
         chat_name = getattr(entity, 'title', None) or getattr(entity, 'username', None) or str(chat_id)
@@ -1062,6 +1092,10 @@ class Scanner:
         if not meta:
             raise ValueError('По ссылке найдено сообщение без видео')
         w, h, duration, size = meta
+        reject_reason = _reject_reason(w, h, duration, size)
+        if reject_reason:
+            raise ValueError(f'Видео не подходит: {reject_reason}')
+        target, orientation = await self._target_for_video(w, h)
         target_msg_id = await self._download_send_delete_with_retry(target, msg, chat_id=chat_id, chat_name=chat_name, progress_cb=progress_cb)
         return {
             'link': clean_link,
@@ -1075,6 +1109,7 @@ class Scanner:
             'size': size,
             'size_human': _format_bytes(size),
             'target_message_id': target_msg_id,
+            'orientation': orientation,
             'elapsed_sec': int(time.time() - start_ts),
         }
 
@@ -1107,10 +1142,6 @@ class Scanner:
         progress_cb: Optional[ProgressCB] = None,
     ) -> dict[str, Any]:
         start_ts = time.time()
-        target = await self._run_with_connection_recovery(
-            f'get_entity:{self.target_bot_username}',
-            lambda: self.client.get_entity(self.target_bot_username),
-        )
         dialogs = await self._run_with_connection_recovery('collect_dialogs', lambda: self._collect_dialogs(opts))
 
         since = _since_dt(opts.mode)
@@ -1120,7 +1151,7 @@ class Scanner:
         total_errors = 0
         total_skipped = 0
         total_video_found = 0
-        reject_reasons = {'not_vertical': 0, 'too_short': 0, 'too_narrow': 0, 'too_small': 0}
+        reject_reasons = {'square': 0, 'too_short': 0, 'too_narrow': 0, 'too_low_resolution': 0, 'too_small': 0}
         per_chat_stats: list[dict[str, Any]] = []
         cancelled = False
         empty_chats: list[dict[str, Any]] = []
@@ -1224,6 +1255,7 @@ class Scanner:
                         continue
 
                     try:
+                        target, orientation = await self._target_for_video(w, h)
                         await self._download_send_delete_with_retry(
                             target,
                             msg,
@@ -1262,6 +1294,7 @@ class Scanner:
                             'checked': total_checked,
                             'matched': total_matched,
                             'forwarded': total_forwarded,
+                            'orientation': orientation,
                         })
 
                     delay = self.forward_delay_sec + random.uniform(0, self.forward_jitter_sec)
