@@ -152,7 +152,7 @@ def _help_text() -> str:
         '/status — показать состояние процесса и heartbeat.\n'
         '/help — краткая справка.\n\n'
         'Можно просто прислать одну или несколько ссылок на страницы с видео — бот сам найдёт видео, выберет лучшее качество, поставит в очередь, '
-        'скачает на сервер, покажет разрешение и размер, создаст превью, отправит в @Content_Vertical_BOT и удалит локальный файл. '
+        'скачает на сервер, покажет разрешение и размер, создаст превью, отправит в целевой канал по ориентации и удалит локальный файл. '
         'Если прислать ссылки во время загрузки, они добавятся в конец текущей очереди. Кнопка «🔗 Ссылки» показывает статистику ручных загрузок.\n\n'
         'Для сканирования: выбери период, выбери чаты или запусти поиск по всем, затем смотри отчёт. '
         'Для безопасной проверки удаления пустых чатов включи <code>DRY_RUN_DELETE=true</code>.'
@@ -353,9 +353,10 @@ def _format_duration(seconds: int | float) -> str:
 
 
 _REJECT_LABELS = {
-    'not_vertical': 'не вертикальные',
+    'square': 'квадратные',
     'too_short': 'короткие',
     'too_narrow': 'узкие',
+    'too_low_resolution': 'низкое разрешение горизонтальных',
     'too_small': 'маленький размер',
 }
 
@@ -673,8 +674,8 @@ async def run_control_bot(
                 'download_done': 'скачано, готовлю обложку',
                 'thumbnail_start': 'генерирую обложку',
                 'thumbnail_done': 'обложка готова' if ev.get('thumb_path') else 'обложку создать не удалось',
-                'upload_start': f'загружаю в @{scanner.target_bot_username}',
-                'upload_progress': f'загружаю в @{scanner.target_bot_username}',
+                'upload_start': 'загружаю в целевой канал по ориентации',
+                'upload_progress': 'загружаю в целевой канал по ориентации',
                 'upload_done': 'загрузка завершена',
                 'local_delete': 'локальный файл удалён',
                 'floodwait': f'FloodWait {ev.get("seconds", 0)} сек',
@@ -771,7 +772,9 @@ async def run_control_bot(
                         title = item.get('title')
                         title_part = f' · {escape(_short_title(str(title), 40))}' if title else ''
                         message_part = f' #{item["message_id"]}' if item.get('message_id') else ''
-                        target_part = f' → @{scanner.target_bot_username} #{item["target_message_id"]}' if item.get('target_message_id') else ''
+                        target_value = scanner.horizontal_target if item.get('orientation') == 'horizontal' else scanner.target_bot_username
+                        target_prefix = '' if str(target_value).lstrip('-').isdigit() else '@'
+                        target_part = f' → {target_prefix}{target_value} #{item["target_message_id"]}' if item.get('target_message_id') else ''
                         details = []
                         if item.get('resolution'):
                             details.append(str(item['resolution']))
@@ -860,8 +863,8 @@ async def run_control_bot(
                 'download_done': 'скачано, готовлю обложку',
                 'thumbnail_start': 'генерирую обложку',
                 'thumbnail_done': 'обложка готова' if ev.get('thumb_path') else 'обложку создать не удалось',
-                'upload_start': f'загружаю в @{scanner.target_bot_username}',
-                'upload_progress': f'загружаю в @{scanner.target_bot_username}',
+                'upload_start': 'загружаю в целевой канал по ориентации',
+                'upload_progress': 'загружаю в целевой канал по ориентации',
                 'upload_done': 'загрузка завершена',
                 'local_delete': 'локальный файл удалён',
                 'forward': 'видео учтено как загруженное',

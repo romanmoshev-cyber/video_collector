@@ -10,7 +10,22 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scanner import MB, STALE_DOWNLOAD_DIR_AGE_SEC, ScanOptions, Scanner, _iter_messages_kwargs, _period_scan_action
+from scanner import MB, STALE_DOWNLOAD_DIR_AGE_SEC, ScanOptions, Scanner, _iter_messages_kwargs, _period_scan_action, _reject_reason, _video_orientation
+
+
+class VideoRulesTest(unittest.TestCase):
+    def test_detects_both_orientations_and_skips_square(self) -> None:
+        self.assertEqual(_video_orientation(1080, 1920), 'vertical')
+        self.assertEqual(_video_orientation(1920, 1080), 'horizontal')
+        self.assertIsNone(_video_orientation(1080, 1080))
+        self.assertEqual(_reject_reason(1080, 1080, 180, 30 * MB), 'square')
+
+    def test_accepts_qualified_vertical_and_horizontal_video(self) -> None:
+        self.assertIsNone(_reject_reason(1080, 1920, 180, 30 * MB))
+        self.assertIsNone(_reject_reason(1280, 720, 180, 30 * MB))
+
+    def test_horizontal_video_requires_720_pixel_height(self) -> None:
+        self.assertEqual(_reject_reason(1280, 719, 180, 30 * MB), 'too_low_resolution')
 
 
 class IterMessagesKwargsTest(unittest.TestCase):
