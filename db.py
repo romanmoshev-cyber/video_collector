@@ -61,6 +61,7 @@ class DB:
                 size INTEGER NOT NULL DEFAULT 0,
                 duration INTEGER NOT NULL DEFAULT 0,
                 target_message_id INTEGER,
+                orientation TEXT,
                 status TEXT NOT NULL,
                 error TEXT,
                 elapsed_sec INTEGER NOT NULL DEFAULT 0,
@@ -68,6 +69,10 @@ class DB:
             );
             '''
         )
+        async with self.conn.execute('PRAGMA table_info(link_uploads)') as cur:
+            link_upload_columns = {str(row['name']) for row in await cur.fetchall()}
+        if 'orientation' not in link_upload_columns:
+            await self.conn.execute('ALTER TABLE link_uploads ADD COLUMN orientation TEXT')
         await self.conn.commit()
 
     async def close(self) -> None:
@@ -203,9 +208,10 @@ class DB:
         await self.conn.execute(
             """
             INSERT INTO link_uploads(
-                link, source_name, title, resolution, size, duration, target_message_id, status, error, elapsed_sec, created_at
+                link, source_name, title, resolution, size, duration, target_message_id, orientation,
+                status, error, elapsed_sec, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(row.get('link') or ''),
@@ -215,6 +221,7 @@ class DB:
                 int(row.get('size', 0) or 0),
                 int(row.get('duration', 0) or 0),
                 row.get('target_message_id'),
+                row.get('orientation'),
                 str(row.get('status') or 'ok'),
                 row.get('error'),
                 int(row.get('elapsed_sec', 0) or 0),
@@ -240,7 +247,8 @@ class DB:
 
         async with self.conn.execute(
             """
-            SELECT link, source_name, title, resolution, size, duration, target_message_id, status, error, elapsed_sec, created_at
+            SELECT link, source_name, title, resolution, size, duration, target_message_id, orientation,
+                   status, error, elapsed_sec, created_at
             FROM link_uploads
             ORDER BY id DESC
             LIMIT 10
