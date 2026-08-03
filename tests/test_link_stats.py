@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+import sqlite3
 import sys
 import unittest
 
@@ -40,6 +41,7 @@ class LinkStatsDBTest(unittest.IsolatedAsyncioTestCase):
                     'size': 10,
                     'duration': 20,
                     'target_message_id': 123,
+                    'orientation': 'horizontal',
                     'status': 'ok',
                     'elapsed_sec': 3,
                     'created_at': 1,
@@ -62,6 +64,29 @@ class LinkStatsDBTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats['bytes_uploaded'], 10)
         self.assertEqual(stats['duration_sec'], 20)
         self.assertEqual(stats['recent'][0]['status'], 'error')
+        self.assertEqual(stats['recent'][1]['orientation'], 'horizontal')
+
+    async def test_existing_database_is_migrated_for_orientation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'bot.sqlite3'
+            with sqlite3.connect(path) as conn:
+                conn.execute(
+                    'CREATE TABLE link_uploads ('
+                    'id INTEGER PRIMARY KEY AUTOINCREMENT, link TEXT NOT NULL, source_name TEXT NOT NULL, '
+                    'title TEXT, resolution TEXT, size INTEGER NOT NULL DEFAULT 0, '
+                    'duration INTEGER NOT NULL DEFAULT 0, target_message_id INTEGER, status TEXT NOT NULL, '
+                    'error TEXT, elapsed_sec INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)'
+                )
+
+            db = DB(path)
+            await db.connect()
+            try:
+                async with db.conn.execute('PRAGMA table_info(link_uploads)') as cur:
+                    columns = {row['name'] for row in await cur.fetchall()}
+            finally:
+                await db.close()
+
+        self.assertIn('orientation', columns)
 
 
 if __name__ == '__main__':
